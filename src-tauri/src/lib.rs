@@ -91,6 +91,97 @@ fn new_req_id() -> String {
     format!("req_{}", Uuid::new_v4().simple())
 }
 
+/// macOS/Windows GUI apps run with a near-empty PATH (no /opt/homebrew/bin, no nvm).
+/// If the user asked for a bare name like "node", try common install locations
+/// so the sidecar still resolves without the user explicitly exporting DSH_RUNTIME_CMD.
+fn resolve_runtime_binary(cmd: &str) -> String {
+    // If absolute or already has a path separator or file extension, pass as-is.
+    if std::path::Path::new(cmd).is_absolute()
+        || cmd.contains('/')
+        || cmd.contains('\\')
+        || cmd.ends_with(".exe")
+    {
+        return cmd.to_string();
+    }
+
+    // First, try the PATH inherited from the current process (works for tauri:dev).
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(cmd);
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+            #[cfg(windows)]
+            {
+                let with_ext = dir.join(format!("{cmd}.exe"));
+                if with_ext.exists() {
+                    return with_ext.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+
+    // Fallbacks: common Node.js install locations (searched in order of popularity).
+    let fallbacks: &[&str] = &[
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/opt/nodes/current/bin/node",
+        "/usr/bin/node",
+        "/nix/var/nix/profiles/default/bin/node",
+        "/opt/homebrew/opt/node@24/bin/node",
+        "/opt/homebrew/opt/node@22/bin/node",
+        "/opt/homebrew/opt/node@23/bin/node",
+        "/usr/local/opt/node@24/bin/node",
+        "/usr/local/opt/node@22/bin/node",
+    ];
+    for p in fallbacks {
+        if std::path::Path::new(p).exists() {
+            return (*p).to_string();
+        }
+    }
+
+    // nvm fallbacks (try common NVM_DIR variants)
+    let nvm_default = std::env::var("HOME").map(|home| format!("{home}/.nvm"));
+    if let Ok(nvm) = std::env::var("NVM_DIR").or_else(|_| nvm_default.clone()) {
+        if let Ok(entries) = std::fs::read_dir(format!("{nvm}/versions/node")) {
+            let mut versions: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            versions.sort();
+            if let Some(latest) = versions.last() {
+                let bin = latest.join("bin").join("node");
+                if bin.exists() {
+                    return bin.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        for p in [
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Program Files (x86)\nodejs\node.exe",
+        ] {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let p = format!("{appdata}\\npm\\node.exe");
+            if std::path::Path::new(&p).exists() {
+                return p;
+            }
+        }
+    }
+
+    // Nothing found. Return the original string; tokio::process::Command will
+    // surface an IO error that we emit back to the UI as a log line.
+    cmd.to_string()
+}
+
 #[derive(Copy, Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum LogLevel {
@@ -246,6 +337,7 @@ async fn dsh_start(
     let cmd = params
         .runtime_cmd
         .unwrap_or_else(|| std::env::var("DSH_RUNTIME_CMD").unwrap_or_else(|_| "node".into()));
+    let cmd = resolve_runtime_binary(&cmd);
     #[cfg(debug_assertions)]
     let default_args: Vec<String> = vec![
         "--import".into(),
@@ -542,7 +634,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "devtools" => {
                 if let Some(w) = app.get_webview_window("main") {
-                    #[cfg(debug_assertions)]
+                    #[cfg(all(debug_assertions, feature = "devtools"))]
                     {
                         use tauri::WebviewWindowExt;
                         if w.is_devtools_open() {

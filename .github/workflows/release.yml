@@ -73,11 +73,35 @@ jobs:
         run: node scripts/bundle-sidecar.mjs
 
       # ---------- Windows NSIS / MSI ----------
-      - name: (Windows) Install WebView2 bootstrapper
+      # NOTE: windows-2022 already has WebView2 Runtime pre-installed (since
+      # mid-2023 all GitHub Windows runners ship it). The Chocolatey package
+      # `microsoft-edge-webview2-runtime` was removed from the community
+      # gallery some time in 2025, so skip the install entirely and just
+      # verify the registry key exists for logs.
+      - name: (Windows) Verify WebView2 installed
         if: runner.os == 'Windows'
-        run: |
-          choco install -y microsoft-edge-webview2-runtime --no-progress || echo "already installed"
         shell: pwsh
+        run: |
+          $paths = @(
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          )
+          $found = $false
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              $v = (Get-ItemProperty $p -ErrorAction SilentlyContinue).pv
+              Write-Host "WebView2 found at $p  (version = $v)"
+              $found = $true
+              break
+            }
+          }
+          if (-not $found) {
+            Write-Host "WebView2 not detected via registry. Downloading Evergreen Bootstrapper and installing..."
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "$env:TEMP\MicrosoftEdgeWebView2Setup.exe" -UseBasicParsing
+            & "$env:TEMP\MicrosoftEdgeWebView2Setup.exe" /silent /install | Out-Null
+          }
+          Write-Host "WebView2 OK"
 
       - name: (Windows) Build Tauri App (NSIS + MSI)
         if: runner.os == 'Windows'
