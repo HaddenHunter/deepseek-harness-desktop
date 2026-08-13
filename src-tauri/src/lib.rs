@@ -252,7 +252,6 @@ async fn secure_delete(key: String) -> Result<(), String> {
 // --- DSH SDK runtime commands ---
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DshStartParams {
     pub mode: String,
     pub cwd: String,
@@ -260,6 +259,8 @@ pub struct DshStartParams {
     pub model: String,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(alias = "maxTokens")]
+    pub _max_tokens_alias: Option<Option<u32>>,
     #[serde(default)]
     pub plugins: Vec<String>,
     #[serde(default)]
@@ -268,6 +269,100 @@ pub struct DshStartParams {
     pub runtime_cmd: Option<String>,
     #[serde(default)]
     pub runtime_args: Option<Vec<String>>,
+}
+
+// Tauri by default rejects top-level unknown fields on #[tauri::command] args,
+// returning the cryptic "missing required key params" aggregate error whenever
+// the frontend sends a field the struct doesn't declare (e.g. camelCase when
+// struct is snake_case, or old aliases). Accept unknowns transparently so
+// older frontend builds keep working against newer Rust shells and vice versa.
+#[derive(Debug, Deserialize)]
+struct DshStartParamsRelaxed(serde_json::Value);
+
+impl DshStartParamsRelaxed {
+    fn into_concrete(self) -> Result<DshStartParams, String> {
+        let v = self.0;
+        // Accept camelCase or snake_case for every field; normalize to owned Rust values.
+        let get = |k: &str, alt: &str| -> Option<&serde_json::Value> {
+            v.get(k).or_else(|| v.get(alt)).filter(|x| !x.is_null())
+        };
+        let get_str = |k, alt| {
+            get(k, alt)
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_owned())
+                .ok_or_else(|| format!("dsh_start missing required key `{k}` (or `{alt}`)"))
+        };
+        let get_u32_opt = |k, alt| -> Result<Option<u32>, String> {
+            match get(k, alt) {
+                None => Ok(None),
+                Some(v) => {
+                    if let Some(n) = v.as_u64() {
+                        Ok(Some(n.try_into().map_err(|_| {
+                            format!("dsh_start key `{k}` out of u32 range")
+                        })?))
+                    } else if let Some(f) = v.as_f64() {
+                        Ok(Some((f as u64).try_into().map_err(|_| {
+                            format!("dsh_start key `{k}` out of u32 range")
+                        })?))
+                    } else {
+                        Err(format!("dsh_start key `{k}` must be integer/null"))
+                    }
+                }
+            }
+        };
+        let get_strvec = |k, alt| -> Vec<String> {
+            match get(k, alt) {
+                Some(serde_json::Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_owned()))
+                    .collect(),
+                _ => vec![],
+            }
+        };
+        let get_map = |k, alt| -> HashMap<String, String> {
+            match get(k, alt) {
+                Some(serde_json::Value::Object(obj)) => obj
+                    .iter()
+                    .filter_map(|(kk, vv)| vv.as_str().map(|s| (kk.clone(), s.to_owned())))
+                    .collect(),
+                _ => HashMap::new(),
+            }
+        };
+        let get_opt_strvec = |k, alt| -> Option<Vec<String>> {
+            match get(k, alt) {
+                Some(serde_json::Value::Array(arr)) => Some(
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_owned()))
+                        .collect(),
+                ),
+                None => None,
+                _ => None,
+            }
+        };
+
+        // Finalize: if max_tokens was None but the alias had a value, use alias.
+        let mut mt = get_u32_opt("max_tokens", "maxTokens")?;
+        if mt.is_none() {
+            if let Some(serde_json::Value::Number(n)) = get("maxTokens", "max_tokens") {
+                mt = n.as_u64().and_then(|x| x.try_into().ok());
+            }
+        }
+
+        Ok(DshStartParams {
+            mode: get_str("mode", "mode")?,
+            cwd: get_str("cwd", "cwd")?,
+            provider: get_str("provider", "provider")?,
+            model: get_str("model", "model")?,
+            max_tokens: mt,
+            _max_tokens_alias: None,
+            plugins: get_strvec("plugins", "plugins"),
+            env: get_map("env", "env"),
+            runtime_cmd: get("runtime_cmd", "runtimeCmd")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_owned()),
+            runtime_args: get_opt_strvec("runtime_args", "runtimeArgs"),
+        })
+    }
 }
 
 async fn rpc_call(
@@ -325,8 +420,14 @@ async fn rpc_call(
 async fn dsh_start(
     app: AppHandle,
     state: State<'_, DshState>,
-    params: DshStartParams,
+    params: serde_json::Value,
 ) -> Result<(), String> {
+    // Decode params "relaxed": accept either snake_case or camelCase, and never
+    // fail on unknown fields. Tauri's default arg deserialization rejects
+    // unknown top-level keys with a cryptic aggregate "missing required key
+    // params" error, so we drive serde_json ourselves.
+    let relaxed = DshStartParamsRelaxed(params);
+    let params = relaxed.into_concrete()?;
     {
         let guard = state.router.lock().await;
         if guard.is_some() {
