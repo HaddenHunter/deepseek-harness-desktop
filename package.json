@@ -10,8 +10,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:dev": "PATH=\"$HOME/.cargo/bin:$PATH\" tauri dev",
+    "tauri:build": "PATH=\"$HOME/.cargo/bin:$PATH\" tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
