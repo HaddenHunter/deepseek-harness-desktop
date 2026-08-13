@@ -94,35 +94,121 @@ fn new_req_id() -> String {
 /// macOS/Windows GUI apps run with a near-empty PATH (no /opt/homebrew/bin, no nvm).
 /// If the user asked for a bare name like "node", try common install locations
 /// so the sidecar still resolves without the user explicitly exporting DSH_RUNTIME_CMD.
+///
+/// The resolver does THREE layers of verification, not just "file exists":
+///   1. metadata().is_file()           — actually exists and is a regular file
+///   2. is_executable()               — has +x on unix or is .exe/.com on windows
+///   3. spawn it with `-e 0` + 3s timeout — really runs (catches arch mismatches,
+///      partial nvm installs, broken shims, Rosetta failures, etc.)
+/// Candidates are accumulated in priority order, and the FIRST one that passes
+/// ALL three checks wins.
 fn resolve_runtime_binary(cmd: &str) -> String {
-    // If absolute or already has a path separator or file extension, pass as-is.
-    if std::path::Path::new(cmd).is_absolute()
+    use std::path::{Path, PathBuf};
+
+    fn is_executable(p: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            p.metadata()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(windows)]
+        {
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("exe") || s.eq_ignore_ascii_case("com"))
+                .unwrap_or(false);
+            ext || p.ends_with("node.exe")
+        }
+    }
+
+    // Try running a candidate with `node -e 0` (valid JavaScript). Returns true
+    // iff it exits 0 within 3 seconds. For non-node binaries (if the user
+    // pointed DSH_RUNTIME_CMD at a native launcher), we still trust existence.
+    fn try_probe(p: &Path) -> bool {
+        let is_node = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.contains("node"))
+            .unwrap_or(false);
+        if !is_node {
+            return true;
+        }
+
+        // Always use std::process + thread-based polling. This keeps probe fully
+        // independent of whether we're inside a tokio runtime and avoids
+        // block_on/block_in_place method drift across tokio versions.
+        let mut child = match std::process::Command::new(p)
+            .arg("-e")
+            .arg("0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        for _ in 0..30 {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => return false,
+            }
+        }
+        let _ = child.kill();
+        false
+    }
+
+    // If absolute or already has a path separator or file extension:
+    //   * if it passes probe, trust the user's explicit choice;
+    //   * otherwise FALL THROUGH to the candidate search so we still find a
+    //     working Node, never returning a path that os-error-2s on spawn.
+    let path = Path::new(cmd);
+    if path.is_absolute()
         || cmd.contains('/')
         || cmd.contains('\\')
         || cmd.ends_with(".exe")
     {
-        return cmd.to_string();
+        if path.is_file() && is_executable(path) && try_probe(path) {
+            return cmd.to_string();
+        }
+        // Fall through — do NOT early-return a known-bad path.
     }
 
-    // First, try the PATH inherited from the current process (works for tauri:dev).
+    // Collect all candidates in priority order.
+    let mut candidates: Vec<PathBuf> = vec![];
+
+    // Z) If the user explicitly gave us a path (case above) that failed probe,
+    //    still leave it as the LAST candidate so the final error message can
+    //    show the exact path the user asked for, instead of a random one from
+    //    the system. We'll try it one last time before giving up.
+    let explicit_user_candidate: Option<PathBuf> = if path.is_absolute()
+        || cmd.contains('/')
+        || cmd.contains('\\')
+        || cmd.ends_with(".exe")
+    {
+        Some(path.to_path_buf())
+    } else {
+        None
+    };
+
+    // A) PATH-derived candidates (process-inherited order)
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(cmd);
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
+            candidates.push(dir.join(cmd));
             #[cfg(windows)]
             {
-                let with_ext = dir.join(format!("{cmd}.exe"));
-                if with_ext.exists() {
-                    return with_ext.to_string_lossy().into_owned();
-                }
+                candidates.push(dir.join(format!("{cmd}.exe")));
             }
         }
     }
 
-    // Fallbacks: common Node.js install locations (searched in order of popularity).
-    let fallbacks: &[&str] = &[
+    // B) Hand-curated popular static locations
+    #[cfg(unix)]
+    for p in [
         "/opt/homebrew/bin/node",
         "/usr/local/bin/node",
         "/opt/nodes/current/bin/node",
@@ -133,52 +219,72 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         "/opt/homebrew/opt/node@23/bin/node",
         "/usr/local/opt/node@24/bin/node",
         "/usr/local/opt/node@22/bin/node",
-    ];
-    for p in fallbacks {
-        if std::path::Path::new(p).exists() {
-            return (*p).to_string();
-        }
+    ] {
+        candidates.push(PathBuf::from(p));
+    }
+    #[cfg(windows)]
+    for p in [
+        r"C:\Program Files\nodejs\node.exe",
+        r"C:\Program Files (x86)\nodejs\node.exe",
+    ] {
+        candidates.push(PathBuf::from(p));
     }
 
-    // nvm fallbacks (try common NVM_DIR variants)
+    // C) nvm: versions sorted newest-first so user's latest installed wins,
+    //    but only after PATH static dirs (we prefer system/brew-wide installs
+    //    that are more likely to be present across archs).
     let nvm_default = std::env::var("HOME").map(|home| format!("{home}/.nvm"));
     if let Ok(nvm) = std::env::var("NVM_DIR").or_else(|_| nvm_default.clone()) {
         if let Ok(entries) = std::fs::read_dir(format!("{nvm}/versions/node")) {
+            let mut versions: Vec<_> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+            versions.sort();
+            versions.reverse(); // newest first
+            for v in versions {
+                candidates.push(v.join("bin").join("node"));
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        candidates.push(PathBuf::from(format!("{appdata}\\npm\\node.exe")));
+    }
+
+    // D) fnm
+    if let Ok(fnm_dir) = std::env::var("FNM_DIR")
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.fnm")))
+    {
+        if let Ok(entries) = std::fs::read_dir(format!("{fnm_dir}/node-versions")) {
             let mut versions: Vec<_> = entries
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| p.is_dir())
                 .collect();
             versions.sort();
-            if let Some(latest) = versions.last() {
-                let bin = latest.join("bin").join("node");
-                if bin.exists() {
-                    return bin.to_string_lossy().into_owned();
-                }
+            versions.reverse();
+            #[cfg(unix)]
+            for v in versions {
+                candidates.push(v.join("installation").join("bin").join("node"));
+            }
+            #[cfg(windows)]
+            for v in versions {
+                candidates.push(v.join("installation").join("node.exe"));
             }
         }
     }
 
-    #[cfg(windows)]
-    {
-        for p in [
-            r"C:\Program Files\nodejs\node.exe",
-            r"C:\Program Files (x86)\nodejs\node.exe",
-        ] {
-            if std::path::Path::new(p).exists() {
-                return p.to_string();
-            }
-        }
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            let p = format!("{appdata}\\npm\\node.exe");
-            if std::path::Path::new(&p).exists() {
-                return p;
-            }
+    // Run 3-step verification against each candidate; return FIRST winner.
+    for c in candidates {
+        if c.is_file() && is_executable(&c) && try_probe(&c) {
+            return c.to_string_lossy().into_owned();
         }
     }
+    if let Some(explicit) = explicit_user_candidate {
+        // User insisted on this path — even though it didn't pass probe, the
+        // error message will show exactly what they typed + OS details.
+        return explicit.to_string_lossy().into_owned();
+    }
 
-    // Nothing found. Return the original string; tokio::process::Command will
-    // surface an IO error that we emit back to the UI as a log line.
+    // Nothing found. Return original so downstream errors say "node" literally.
     cmd.to_string()
 }
 
@@ -251,43 +357,6 @@ async fn secure_delete(key: String) -> Result<(), String> {
 
 // --- DSH SDK runtime commands ---
 
-/// Relaxed parameter shape for dsh_start.
-///
-/// The UI invokes `invoke("dsh_start", { mode, cwd, provider, model, ... })` with
-/// top-level keys — Tauri maps them directly to the struct fields (there is no
-/// outer `params` wrapper). To avoid the extremely misleading aggregate error
-///   `invalid args 'params' for command 'dsh_start': missing required key params`
-/// whenever ANY deserialization fails, this struct:
-///
-///   * declares `#[serde(default)]` on every optional field so new-style frontends
-///     that send fewer fields never error;
-///   * adds `alias = "<camelCase>"` next to snake_case names so old/new frontends
-///     using either convention both work (`maxTokens` / `max_tokens`, etc.);
-///   * captures any unknown keys into a flattened `extra` HashMap so struct-level
-///     `deny_unknown_fields` can never bite us.
-///
-/// The only truly required keys are `mode`, `cwd`, `provider`, `model` — missing
-/// any of these now produces the precise serde error `missing field 'mode'` etc.
-#[derive(Debug, Deserialize)]
-pub struct DshStartParams {
-    pub mode: String,
-    pub cwd: String,
-    pub provider: String,
-    pub model: String,
-    #[serde(default, alias = "maxTokens")]
-    pub max_tokens: Option<u32>,
-    #[serde(default)]
-    pub plugins: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default, alias = "runtimeCmd")]
-    pub runtime_cmd: Option<String>,
-    #[serde(default, alias = "runtimeArgs")]
-    pub runtime_args: Option<Vec<String>>,
-    #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
-}
-
 async fn rpc_call(
     router: &Arc<RpcRouter>,
     method: &str,
@@ -339,47 +408,193 @@ async fn rpc_call(
     }
 }
 
-// NOTE: the argument list here MUST exactly match the keys the frontend sends in
-//   await invoke("dsh_start", { mode, cwd, provider, model, max_tokens, maxTokens,
-//                                plugins, env, runtime_cmd, runtimeCmd,
-//                                runtime_args, runtimeArgs })
-// We deliberately avoid taking a single struct param. Tauri aggregates all
-// struct-deserialize failures into a single cryptic string that looks like
-//   "invalid args 'params' for command 'dsh_start': missing required key params"
-// which does not name the real field mismatch. By listing each argument by name,
-// any missing key error becomes precise (e.g. "missing field 'mode'") and
-// Option<T> handles forward/backward compat (snake_case + camelCase variants are
-// duplicated as separate params, then merged in the body).
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-async fn dsh_start(
-    app: AppHandle,
-    state: State<'_, DshState>,
+// dsh_start contract v2 (v0.1.3+).
+//
+// FRONTEND (DshRuntime.start()) sends:
+//   await invoke("dsh_start", {
+//     data: {
+//       mode, cwd, provider, model,
+//       max_tokens, maxTokens,            // both copies, either works
+//       plugins, env,
+//       runtime_cmd, runtimeCmd,          // optional
+//       runtime_args, runtimeArgs,        // optional
+//     }
+//   })
+//
+// RUST SIDE takes exactly ONE named parameter: `data: serde_json::Value`.
+// Parameter name is deliberately `data`, never `params`, because Tauri's
+// proc-macro aggregates struct-deserialize failures into a string like
+//   "invalid args 'PARAM_NAME' for command 'dsh_start': missing required key
+//    PARAM_NAME"
+// which is indistinguishable to users from a genuine missing JSON field
+// called "params". With param name = `data` AND the param type being a raw
+// Value (which never fails deserialization for any valid JSON payload), the
+// "missing required key params" error string CANNOT appear anymore — full
+// stop. Any real schema/type/omission error is a string we hand-write below.
+#[derive(Debug, Clone)]
+struct DshStartParsed {
     mode: String,
     cwd: String,
     provider: String,
     model: String,
     max_tokens: Option<u32>,
-    maxTokens: Option<u32>,
-    plugins: Option<Vec<String>>,
-    env: Option<HashMap<String, String>>,
+    plugins: Vec<String>,
+    env: HashMap<String, String>,
     runtime_cmd: Option<String>,
-    runtimeCmd: Option<String>,
     runtime_args: Option<Vec<String>>,
-    runtimeArgs: Option<Vec<String>>,
-    // Unknown extras — the `_trailing_args_json` trick does not exist on Tauri
-    // args, so instead we lean on the documented Tauri behaviour: extra named
-    // arguments not declared here are silently ignored for invoke.  Any other
-    // struct-driven deserialize path was the source of the "missing required
-    // key params" message; pure flat args don't trigger it.
+}
+
+fn parse_dsh_start_data(data: &serde_json::Value) -> Result<DshStartParsed, String> {
+    use serde_json::Value;
+
+    // Helper: accept a key OR its snake_case / camelCase alternate.
+    let get = |k1: &str, k2: &str| -> Option<&Value> {
+        match (data.get(k1), data.get(k2)) {
+            (Some(v), _) if !v.is_null() => Some(v),
+            (_, Some(v)) if !v.is_null() => Some(v),
+            _ => None,
+        }
+    };
+    let req_str = |k1, k2| -> Result<String, String> {
+        get(k1, k2)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| {
+                format!(
+                    "dsh_start: missing or non-string key `{}` (or alias `{}`) inside `data`. \
+                    Frontend must send invoke(\"dsh_start\", {{ data: {{ {k2}: ..., ... }} }}).",
+                    k1, k2
+                )
+            })
+    };
+    let opt_u32 = |k1, k2| -> Result<Option<u32>, String> {
+        match get(k1, k2) {
+            None => Ok(None),
+            Some(Value::Number(n)) => n
+                .as_u64()
+                .and_then(|x| u32::try_from(x).ok())
+                .map(Some)
+                .ok_or_else(|| format!("dsh_start: key `{k1}` (or `{k2}`) must be integer u32")),
+            Some(_) => Err(format!(
+                "dsh_start: key `{k1}` (or `{k2}`) must be integer u32 or null"
+            )),
+        }
+    };
+    let opt_vecstr = |k1, k2| -> Result<Option<Vec<String>>, String> {
+        match get(k1, k2) {
+            None => Ok(None),
+            Some(Value::Array(arr)) => Ok(Some(
+                arr.iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(|s| s.to_owned())
+                            .ok_or_else(|| {
+                                format!("dsh_start: item in `{k1}`/`{k2}` array must be string")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            Some(_) => Err(format!(
+                "dsh_start: key `{k1}` (or `{k2}`) must be array of strings or null"
+            )),
+        }
+    };
+    let opt_mapstr = |k1, k2| -> Result<Option<HashMap<String, String>>, String> {
+        match get(k1, k2) {
+            None => Ok(None),
+            Some(Value::Object(obj)) => Ok(Some(
+                obj.iter()
+                    .map(|(kk, vv)| {
+                        vv.as_str()
+                            .map(|s| (kk.clone(), s.to_owned()))
+                            .ok_or_else(|| {
+                                format!(
+                                    "dsh_start: value for `{k1}`/`{k2}` key `{kk}` must be string"
+                                )
+                            })
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()?,
+            )),
+            Some(_) => Err(format!(
+                "dsh_start: key `{k1}` (or `{k2}`) must be object(str->str) or null"
+            )),
+        }
+    };
+
+    Ok(DshStartParsed {
+        mode: req_str("mode", "mode")?,
+        cwd: req_str("cwd", "cwd")?,
+        provider: req_str("provider", "provider")?,
+        model: req_str("model", "model")?,
+        max_tokens: opt_u32("max_tokens", "maxTokens")?,
+        plugins: opt_vecstr("plugins", "plugins")?.unwrap_or_default(),
+        env: opt_mapstr("env", "env")?.unwrap_or_default(),
+        runtime_cmd: get("runtime_cmd", "runtimeCmd")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned()),
+        runtime_args: opt_vecstr("runtime_args", "runtimeArgs")?,
+    })
+}
+
+#[tauri::command]
+async fn dsh_start(
+    app: AppHandle,
+    state: State<'_, DshState>,
+    data: serde_json::Value,
 ) -> Result<(), String> {
-    // Merge snake_case + camelCase variants. The snake_case copy wins if both
-    // are supplied.
-    let max_tokens = max_tokens.or(maxTokens);
-    let runtime_cmd = runtime_cmd.or(runtimeCmd);
-    let runtime_args = runtime_args.or(runtimeArgs);
-    let plugins = plugins.unwrap_or_default();
-    let env = env.unwrap_or_default();
+    // 1) Defensive: if `data` is actually an Object but the user sent the OLD
+    // flat format (`{mode, cwd, ...}` with no `data` wrapper), accept it too
+    // so mismatched frontend <-> shell pairs still boot.
+    let obj = match &data {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => {
+            return Err(
+                "dsh_start: invoke payload must be a JSON object, got something else. \
+                Expected: invoke(\"dsh_start\", { data: { mode, cwd, ... } })"
+                    .to_string(),
+            );
+        }
+    };
+    let inner = if obj.contains_key("data") && obj.get("data").unwrap().is_object() {
+        // v2 contract: { data: {mode,cwd,...} }
+        obj.get("data").cloned().unwrap()
+    } else {
+        // Legacy flat contract: {mode,cwd,...} at top level. Permit it silently so
+        // old frontends still come up. Any real schema gaps surface in parse().
+        emit_log(
+            &app,
+            LogLevel::Warn,
+            "dsh_start: received legacy flat payload (no `data` wrapper). \
+            Upgrade both frontend + Rust shell to v0.1.3+ to silence this.",
+        );
+        data.clone()
+    };
+
+    // 2) Parse the real payload. All error strings from here are ours.
+    let p = parse_dsh_start_data(&inner).map_err(|e| {
+        // Emit to the app log stream as well so Console.app shows the precise
+        // failure even before the user reads the in-app red banner.
+        emit_log(&app, LogLevel::Error, &format!("[dsh-start-parse] {e}"));
+        e
+    })?;
+
+    // 3) Log (sanitized) what we received so users can prove the shell saw
+    // their payload shape instead of having to guess.
+    emit_log(
+        &app,
+        LogLevel::Info,
+        &format!(
+            "[dsh-start] mode={} cwd={} provider={} model={} plugins.len={} runtime_cmd={:?}",
+            p.mode,
+            p.cwd,
+            p.provider,
+            p.model,
+            p.plugins.len(),
+            p.runtime_cmd,
+        ),
+    );
+
+    // 4) Early-exit if already running.
     {
         let guard = state.router.lock().await;
         if guard.is_some() {
@@ -387,15 +602,41 @@ async fn dsh_start(
         }
     }
 
+    let DshStartParsed {
+        mode,
+        cwd,
+        provider,
+        model,
+        max_tokens,
+        plugins,
+        env,
+        runtime_cmd,
+        runtime_args,
+    } = p;
+
     let cmd = runtime_cmd
         .unwrap_or_else(|| std::env::var("DSH_RUNTIME_CMD").unwrap_or_else(|_| "node".into()));
     let cmd = resolve_runtime_binary(&cmd);
+
+    // --- Resolve debug sidecar entry to an ABSOLUTE PATH relative to the
+    //     repo workspace ($CARGO_MANIFEST_DIR/../scripts/...). Without this,
+    //     child.current_dir() gets set to the user's workspace cwd and the
+    //     relative `scripts/dsh-jsonrpc-entry.ts` can't be found → ENOENT.
     #[cfg(debug_assertions)]
-    let default_args: Vec<String> = vec![
-        "--import".into(),
-        "tsx/esm".into(),
-        "scripts/dsh-jsonrpc-entry.ts".into(),
-    ];
+    let default_args: Vec<String> = {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")); // dsh-desktop/src-tauri
+        let workspace_dir = manifest_dir.parent().expect("src-tauri parent is workspace dir");
+        let entry_ts = workspace_dir.join("scripts").join("dsh-jsonrpc-entry.ts");
+        let entry_ts = match std::fs::canonicalize(&entry_ts) {
+            Ok(p) => p,
+            Err(_) => entry_ts, // if not present yet, canonicalize fails but we keep the absolute form for a clearer error
+        };
+        vec![
+            "--import".into(),
+            "tsx/esm".into(),
+            entry_ts.to_string_lossy().into_owned(),
+        ]
+    };
     #[cfg(not(debug_assertions))]
     let default_args: Vec<String> = {
         let bundled = std::env::var("DSH_BUNDLED_CJS").unwrap_or_else(|_| {
@@ -437,8 +678,28 @@ async fn dsh_start(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("failed to spawn dsh runtime '{cmd}'"))
-        .map_err(|e| e.to_string())?;
+        .map_err(|io_err| {
+            // Attach OS-level cause so the user can see "os error 2 = no such
+            // file" vs "os error 8 = exec format / wrong arch" vs permission
+            // denied etc., instead of a bare "failed to spawn" message.
+            let os_code = io_err
+                .raw_os_error()
+                .map(|c| format!(" (os error {c})"))
+                .unwrap_or_default();
+            let kind: String = match io_err.kind() {
+                std::io::ErrorKind::NotFound => " (no such file or directory)".into(),
+                std::io::ErrorKind::PermissionDenied => " (permission denied)".into(),
+                k => format!(" (io::ErrorKind::{k:?})"),
+            };
+            format!(
+                "failed to spawn dsh runtime '{cmd}': {io_err}{os_code}{kind}. \
+                Runtime args: [{}]. \
+                Hint: if the path looks correct, confirm it matches your CPU architecture \
+                (arm64 vs x86_64) and has +x permission. Export DSH_RUNTIME_CMD=<absolute path> \
+                to force a specific binary.",
+                args.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ")
+            )
+        })?;
 
     let child_pid = child.id().unwrap_or(0);
     let stdin = child.stdin.take().ok_or_else(|| "no stdin".to_string())?;

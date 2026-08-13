@@ -268,31 +268,64 @@ export class DshRuntime implements IRuntime {
         extraSettings.runtimeCmd ?? this.settings.runtimeCmd;
       const userRuntimeArgs: string[] | undefined =
         extraSettings.runtimeArgs ?? this.settings.runtimeArgs;
-      await invoke<void>("dsh_start", {
-        mode,
-        cwd: typeof cwd === "string" ? cwd : ".",
-        provider: active?.provider ?? "deepseek-official",
-        model: active?.modelId ?? "deepseek-v4-flash",
-        max_tokens: this.settings.maxTokens,
-        maxTokens: this.settings.maxTokens,
-        plugins: overrides?.plugins ?? [],
-        env: {},
-        runtime_cmd: userRuntimeCmd,
-        runtimeCmd: userRuntimeCmd,
-        runtime_args: userRuntimeArgs,
-        runtimeArgs: userRuntimeArgs,
-      });
+      // IMPORTANT: wrap every concrete field inside `data`. The Rust side
+      // signature is `dsh_start(..., data: serde_json::Value)` with a single
+      // parameter named `data` (never `params`) so Tauri can never produce the
+      // cryptic "missing required key params" aggregate error even under any
+      // serde fallback. This payload shape is a hard contract — change the
+      // Rust side first if you add/rename keys here.
+      //
+      // We emit BOTH snake_case and camelCase copies of every denormalisable
+      // field inside `data` so the Rust extractor can run unchanged against
+      // older frontend builds or mismatched frontend/Rust combinations.
+      const payload: Record<string, unknown> = {
+        data: {
+          mode,
+          cwd: typeof cwd === "string" ? cwd : ".",
+          provider: active?.provider ?? "deepseek-official",
+          model: active?.modelId ?? "deepseek-v4-flash",
+          max_tokens: this.settings.maxTokens,
+          maxTokens: this.settings.maxTokens,
+          plugins: overrides?.plugins ?? [],
+          env: {},
+          runtime_cmd: userRuntimeCmd,
+          runtimeCmd: userRuntimeCmd,
+          runtime_args: userRuntimeArgs,
+          runtimeArgs: userRuntimeArgs,
+        },
+      };
+      await invoke<void>("dsh_start", payload);
     } catch (e) {
       const raw = e instanceof Error ? e.message : String(e);
-      // Only append the SDK install tip when the underlying error is actually
-      // about spawn/node/ENOENT/tsx resolution, so field-name mismatches (the
-      // classic "missing required key params" Tauri aggregate error) do not get
-      // masked behind a misleading "make sure packages are installed" hint.
-      const looksLikeSpawnError = /(spawn|ENOENT|failed to spawn|node\b|tsx\b|not found|cannot find module|command not found)/i.test(raw);
+
+      // Decide if the SDK "ensure packages installed + tsx" tip is actually
+      // helpful. Only apply when the error looks like a pure path resolution
+      // problem that the tip actually solves. Exclusions:
+      //   * raw already mentions "os error" / "io::ErrorKind" / "PermissionDenied"
+      //     → Rust has already attached detailed spawn context; repeating the
+      //       generic SDK install hint is noise.
+      //   * raw mentions "initialize handshake" / "JSON-RPC" → SDK sidecar
+      //     actually ran, so packages ARE installed.
+      const hasDetailedSpawnContext =
+        /os error|io::ErrorKind|no such file|permission denied|exec format|wrong arch/i.test(raw);
+      const runtimeActuallyLaunched =
+        /initialize handshake|JSON-RPC|malformed JSON-RPC|session\.event|serverInfo/i.test(raw);
+
+      const looksLikeSpawnError =
+        !hasDetailedSpawnContext &&
+        !runtimeActuallyLaunched &&
+        /(spawn|ENOENT|failed to spawn|node\b|tsx\b|cannot find module|command not found)/i.test(raw);
+
       const tip = looksLikeSpawnError
         ? ` Tip: ensure @deepseek-ai/dsh-agent-spine-demo + @deepseek-ai/dsh-sdk-jsonrpc-server + tsx are installed, or export DSH_RUNTIME_CMD/ARGS pointing at a harness executable (JSON-RPC over stdio).`
         : "";
-      throw new Error(`DSH SDK bridge start failed: ${raw}.${tip}`);
+
+      // Detect legacy Rust shells (< v0.1.3 contract) and direct the user to upgrade.
+      const legacyHint = /missing required key params/i.test(raw)
+        ? " (legacy-hint: this exact error string only appears with Rust shells < v0.1.3; quit the app, download the latest v0.1.3+ dmg/exe from the GitHub Releases page and overwrite the installed copy.)"
+        : "";
+
+      throw new Error(`DSH SDK bridge start failed: ${raw}.${tip}${legacyHint}`);
     }
     await this.ensureSubscription();
     this.ready = true;
