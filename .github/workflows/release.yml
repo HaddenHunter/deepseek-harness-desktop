@@ -1,0 +1,136 @@
+name: Build & Release (cross-platform)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Mark release as a prerelease
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin-universal
+            ext: dmg
+            bundle_dir: dmg
+          - os: windows-2022
+            platform: win64-nsis
+            ext: exe
+            bundle_dir: nsis
+          - os: windows-2022
+            platform: win64-msi
+            ext: msi
+            bundle_dir: msi
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: (macOS) Install universal Rust targets
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install npm dependencies
+        run: npm ci || npm install
+
+      - name: Build frontend + sidecar
+        run: npm run build
+
+      - name: Package SDK sidecar CJS
+        run: node scripts/bundle-sidecar.mjs
+
+      # ---------- Windows NSIS / MSI ----------
+      - name: (Windows) Install WebView2 bootstrapper
+        if: runner.os == 'Windows'
+        run: |
+          choco install -y microsoft-edge-webview2-runtime --no-progress || echo "already installed"
+        shell: pwsh
+
+      - name: (Windows) Build Tauri App (NSIS + MSI)
+        if: runner.os == 'Windows'
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: --verbose
+          projectPath: .
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------- macOS Universal ----------
+      - name: (macOS) Build universal Tauri App
+        if: runner.os == 'macOS'
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: --target universal-apple-darwin --verbose
+          projectPath: .
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build artifacts (Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-${{ matrix.platform }}
+          path: |
+            src-tauri/target/release/bundle/${{ matrix.bundle_dir }}/*.${{ matrix.ext }}
+            src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: ignore
+
+  release:
+    name: Draft GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List artifacts for release
+        run: find artifacts -type f 2>/dev/null || echo "no artifacts"
+
+      - name: Create Release + upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.exe
+            artifacts/**/*.msi
+            artifacts/**/*.zip
+            artifacts/**/*.deb
+            artifacts/**/*.AppImage
+          prerelease: ${{ github.event.inputs.prerelease != 'false' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false

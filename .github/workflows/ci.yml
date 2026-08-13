@@ -1,0 +1,45 @@
+name: CI (build + typecheck)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck & Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci || npm install
+      - run: npx tsc -b
+      - run: npm run build
+      - run: node scripts/bundle-sidecar.mjs
+
+  rust:
+    name: cargo check
+    runs-on: ubuntu-latest
+    container: ghcr.io/tauri-apps/cross:x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Node.js (sidecar)
+        run: |
+          apt-get update && apt-get install -y ca-certificates curl gnupg && \
+          curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+          apt-get install -y nodejs
+      - name: NPM deps
+        run: npm ci || npm install
+      - name: Bundle sidecar
+        run: node scripts/bundle-sidecar.mjs
+      - name: cargo check (linux)
+        working-directory: src-tauri
+        run: cargo check --release --locked
