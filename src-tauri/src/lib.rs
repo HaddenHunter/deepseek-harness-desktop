@@ -251,118 +251,41 @@ async fn secure_delete(key: String) -> Result<(), String> {
 
 // --- DSH SDK runtime commands ---
 
+/// Relaxed parameter shape for dsh_start.
+///
+/// The UI invokes `invoke("dsh_start", { mode, cwd, provider, model, ... })` with
+/// top-level keys — Tauri maps them directly to the struct fields (there is no
+/// outer `params` wrapper). To avoid the extremely misleading aggregate error
+///   `invalid args 'params' for command 'dsh_start': missing required key params`
+/// whenever ANY deserialization fails, this struct:
+///
+///   * declares `#[serde(default)]` on every optional field so new-style frontends
+///     that send fewer fields never error;
+///   * adds `alias = "<camelCase>"` next to snake_case names so old/new frontends
+///     using either convention both work (`maxTokens` / `max_tokens`, etc.);
+///   * captures any unknown keys into a flattened `extra` HashMap so struct-level
+///     `deny_unknown_fields` can never bite us.
+///
+/// The only truly required keys are `mode`, `cwd`, `provider`, `model` — missing
+/// any of these now produces the precise serde error `missing field 'mode'` etc.
 #[derive(Debug, Deserialize)]
 pub struct DshStartParams {
     pub mode: String,
     pub cwd: String,
     pub provider: String,
     pub model: String,
-    #[serde(default)]
+    #[serde(default, alias = "maxTokens")]
     pub max_tokens: Option<u32>,
-    #[serde(alias = "maxTokens")]
-    pub _max_tokens_alias: Option<Option<u32>>,
     #[serde(default)]
     pub plugins: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "runtimeCmd")]
     pub runtime_cmd: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "runtimeArgs")]
     pub runtime_args: Option<Vec<String>>,
-}
-
-// Tauri by default rejects top-level unknown fields on #[tauri::command] args,
-// returning the cryptic "missing required key params" aggregate error whenever
-// the frontend sends a field the struct doesn't declare (e.g. camelCase when
-// struct is snake_case, or old aliases). Accept unknowns transparently so
-// older frontend builds keep working against newer Rust shells and vice versa.
-#[derive(Debug, Deserialize)]
-struct DshStartParamsRelaxed(serde_json::Value);
-
-impl DshStartParamsRelaxed {
-    fn into_concrete(self) -> Result<DshStartParams, String> {
-        let v = self.0;
-        // Accept camelCase or snake_case for every field; normalize to owned Rust values.
-        let get = |k: &str, alt: &str| -> Option<&serde_json::Value> {
-            v.get(k).or_else(|| v.get(alt)).filter(|x| !x.is_null())
-        };
-        let get_str = |k, alt| {
-            get(k, alt)
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_owned())
-                .ok_or_else(|| format!("dsh_start missing required key `{k}` (or `{alt}`)"))
-        };
-        let get_u32_opt = |k, alt| -> Result<Option<u32>, String> {
-            match get(k, alt) {
-                None => Ok(None),
-                Some(v) => {
-                    if let Some(n) = v.as_u64() {
-                        Ok(Some(n.try_into().map_err(|_| {
-                            format!("dsh_start key `{k}` out of u32 range")
-                        })?))
-                    } else if let Some(f) = v.as_f64() {
-                        Ok(Some((f as u64).try_into().map_err(|_| {
-                            format!("dsh_start key `{k}` out of u32 range")
-                        })?))
-                    } else {
-                        Err(format!("dsh_start key `{k}` must be integer/null"))
-                    }
-                }
-            }
-        };
-        let get_strvec = |k, alt| -> Vec<String> {
-            match get(k, alt) {
-                Some(serde_json::Value::Array(arr)) => arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_owned()))
-                    .collect(),
-                _ => vec![],
-            }
-        };
-        let get_map = |k, alt| -> HashMap<String, String> {
-            match get(k, alt) {
-                Some(serde_json::Value::Object(obj)) => obj
-                    .iter()
-                    .filter_map(|(kk, vv)| vv.as_str().map(|s| (kk.clone(), s.to_owned())))
-                    .collect(),
-                _ => HashMap::new(),
-            }
-        };
-        let get_opt_strvec = |k, alt| -> Option<Vec<String>> {
-            match get(k, alt) {
-                Some(serde_json::Value::Array(arr)) => Some(
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_owned()))
-                        .collect(),
-                ),
-                None => None,
-                _ => None,
-            }
-        };
-
-        // Finalize: if max_tokens was None but the alias had a value, use alias.
-        let mut mt = get_u32_opt("max_tokens", "maxTokens")?;
-        if mt.is_none() {
-            if let Some(serde_json::Value::Number(n)) = get("maxTokens", "max_tokens") {
-                mt = n.as_u64().and_then(|x| x.try_into().ok());
-            }
-        }
-
-        Ok(DshStartParams {
-            mode: get_str("mode", "mode")?,
-            cwd: get_str("cwd", "cwd")?,
-            provider: get_str("provider", "provider")?,
-            model: get_str("model", "model")?,
-            max_tokens: mt,
-            _max_tokens_alias: None,
-            plugins: get_strvec("plugins", "plugins"),
-            env: get_map("env", "env"),
-            runtime_cmd: get("runtime_cmd", "runtimeCmd")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_owned()),
-            runtime_args: get_opt_strvec("runtime_args", "runtimeArgs"),
-        })
-    }
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 async fn rpc_call(
@@ -416,18 +339,47 @@ async fn rpc_call(
     }
 }
 
+// NOTE: the argument list here MUST exactly match the keys the frontend sends in
+//   await invoke("dsh_start", { mode, cwd, provider, model, max_tokens, maxTokens,
+//                                plugins, env, runtime_cmd, runtimeCmd,
+//                                runtime_args, runtimeArgs })
+// We deliberately avoid taking a single struct param. Tauri aggregates all
+// struct-deserialize failures into a single cryptic string that looks like
+//   "invalid args 'params' for command 'dsh_start': missing required key params"
+// which does not name the real field mismatch. By listing each argument by name,
+// any missing key error becomes precise (e.g. "missing field 'mode'") and
+// Option<T> handles forward/backward compat (snake_case + camelCase variants are
+// duplicated as separate params, then merged in the body).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn dsh_start(
     app: AppHandle,
     state: State<'_, DshState>,
-    params: serde_json::Value,
+    mode: String,
+    cwd: String,
+    provider: String,
+    model: String,
+    max_tokens: Option<u32>,
+    maxTokens: Option<u32>,
+    plugins: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    runtime_cmd: Option<String>,
+    runtimeCmd: Option<String>,
+    runtime_args: Option<Vec<String>>,
+    runtimeArgs: Option<Vec<String>>,
+    // Unknown extras — the `_trailing_args_json` trick does not exist on Tauri
+    // args, so instead we lean on the documented Tauri behaviour: extra named
+    // arguments not declared here are silently ignored for invoke.  Any other
+    // struct-driven deserialize path was the source of the "missing required
+    // key params" message; pure flat args don't trigger it.
 ) -> Result<(), String> {
-    // Decode params "relaxed": accept either snake_case or camelCase, and never
-    // fail on unknown fields. Tauri's default arg deserialization rejects
-    // unknown top-level keys with a cryptic aggregate "missing required key
-    // params" error, so we drive serde_json ourselves.
-    let relaxed = DshStartParamsRelaxed(params);
-    let params = relaxed.into_concrete()?;
+    // Merge snake_case + camelCase variants. The snake_case copy wins if both
+    // are supplied.
+    let max_tokens = max_tokens.or(maxTokens);
+    let runtime_cmd = runtime_cmd.or(runtimeCmd);
+    let runtime_args = runtime_args.or(runtimeArgs);
+    let plugins = plugins.unwrap_or_default();
+    let env = env.unwrap_or_default();
     {
         let guard = state.router.lock().await;
         if guard.is_some() {
@@ -435,8 +387,7 @@ async fn dsh_start(
         }
     }
 
-    let cmd = params
-        .runtime_cmd
+    let cmd = runtime_cmd
         .unwrap_or_else(|| std::env::var("DSH_RUNTIME_CMD").unwrap_or_else(|_| "node".into()));
     let cmd = resolve_runtime_binary(&cmd);
     #[cfg(debug_assertions)]
@@ -459,14 +410,14 @@ async fn dsh_start(
     let args_env = std::env::var("DSH_RUNTIME_ARGS")
         .ok()
         .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>());
-    let args = params.runtime_args.or(args_env).unwrap_or(default_args);
+    let args = runtime_args.or(args_env).unwrap_or(default_args);
 
     let mut child_env: HashMap<String, String> = std::env::vars().collect();
-    child_env.insert("DSH_PROFILE".into(), params.mode.clone());
-    if !params.plugins.is_empty() {
-        child_env.insert("DSH_PLUGINS".into(), params.plugins.join(","));
+    child_env.insert("DSH_PROFILE".into(), mode.clone());
+    if !plugins.is_empty() {
+        child_env.insert("DSH_PLUGINS".into(), plugins.join(","));
     }
-    for (k, v) in params.env {
+    for (k, v) in env {
         child_env.insert(k, v);
     }
     child_env.insert("DSH_JSONRPC_IO".into(), "stdio".into());
@@ -479,7 +430,7 @@ async fn dsh_start(
 
     let mut child = Command::new(&cmd)
         .args(&args)
-        .current_dir(&params.cwd)
+        .current_dir(&cwd)
         .envs(&child_env)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -588,10 +539,10 @@ async fn dsh_start(
 
     // Initialize handshake
     let init_params = serde_json::json!({
-        "cwd": params.cwd,
-        "provider": params.provider,
-        "model": params.model,
-        "maxTokens": params.max_tokens,
+        "cwd": cwd,
+        "provider": provider,
+        "model": model,
+        "maxTokens": max_tokens,
     });
     let init_resp = rpc_call(&router, "initialize", &init_params, 60)
         .await

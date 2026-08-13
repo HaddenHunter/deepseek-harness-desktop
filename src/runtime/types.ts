@@ -124,6 +124,8 @@ export interface UserSettings {
   toolApprovalAutoDeny: string[];
   telemetry: boolean;
   theme: "dark" | "light" | "system";
+  runtimeCmd?: string;
+  runtimeArgs?: string[];
 }
 
 export interface RuntimeStats {

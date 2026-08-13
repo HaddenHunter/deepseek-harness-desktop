@@ -263,21 +263,36 @@ export class DshRuntime implements IRuntime {
     const { invoke } = await getTauri();
     void cwd;
     try {
+      const extraSettings = overrides?.settings ?? {};
+      const userRuntimeCmd: string | undefined =
+        extraSettings.runtimeCmd ?? this.settings.runtimeCmd;
+      const userRuntimeArgs: string[] | undefined =
+        extraSettings.runtimeArgs ?? this.settings.runtimeArgs;
       await invoke<void>("dsh_start", {
         mode,
         cwd: typeof cwd === "string" ? cwd : ".",
         provider: active?.provider ?? "deepseek-official",
         model: active?.modelId ?? "deepseek-v4-flash",
         max_tokens: this.settings.maxTokens,
+        maxTokens: this.settings.maxTokens,
         plugins: overrides?.plugins ?? [],
         env: {},
+        runtime_cmd: userRuntimeCmd,
+        runtimeCmd: userRuntimeCmd,
+        runtime_args: userRuntimeArgs,
+        runtimeArgs: userRuntimeArgs,
       });
     } catch (e) {
-      throw new Error(
-        `DSH SDK bridge start failed: ${e instanceof Error ? e.message : String(e)}. ` +
-        `Tip: ensure @deepseek-ai/dsh-agent-spine-demo + @deepseek-ai/dsh-sdk-jsonrpc-server + tsx are installed, ` +
-        `or export DSH_RUNTIME_CMD/ARGS pointing at a harness executable (JSON-RPC over stdio).`
-      );
+      const raw = e instanceof Error ? e.message : String(e);
+      // Only append the SDK install tip when the underlying error is actually
+      // about spawn/node/ENOENT/tsx resolution, so field-name mismatches (the
+      // classic "missing required key params" Tauri aggregate error) do not get
+      // masked behind a misleading "make sure packages are installed" hint.
+      const looksLikeSpawnError = /(spawn|ENOENT|failed to spawn|node\b|tsx\b|not found|cannot find module|command not found)/i.test(raw);
+      const tip = looksLikeSpawnError
+        ? ` Tip: ensure @deepseek-ai/dsh-agent-spine-demo + @deepseek-ai/dsh-sdk-jsonrpc-server + tsx are installed, or export DSH_RUNTIME_CMD/ARGS pointing at a harness executable (JSON-RPC over stdio).`
+        : "";
+      throw new Error(`DSH SDK bridge start failed: ${raw}.${tip}`);
     }
     await this.ensureSubscription();
     this.ready = true;
