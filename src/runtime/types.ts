@@ -126,6 +126,29 @@ export interface UserSettings {
   theme: "dark" | "light" | "system";
   runtimeCmd?: string;
   runtimeArgs?: string[];
+  // ---------- 外观（预留：皮肤 / 主题） ----------
+  appearance: {
+    accentColor: string;
+    skin: "default" | "catppuccin-mocha" | "dracula" | "solarized-light" | "rose-pine" | "nord";
+    fontFamily: string;
+    fontScale: number;
+    sidebarDensity: "compact" | "normal" | "relaxed";
+    messageBubbles: boolean;
+  };
+  // ---------- 桌面宠物（预留） ----------
+  desktopPet: {
+    enabled: boolean;
+    avatar: "fox" | "cat" | "dog" | "raccoon" | "custom";
+    customAvatarUrl?: string;
+    size: number;
+    opacity: number;
+    interactive: boolean;
+    mood: "idle" | "curious" | "working" | "happy";
+    position: { x: number; y: number };
+    anchor: "bottom-right" | "bottom-left" | "top-right" | "top-left" | "floating";
+    notifyOnEvents: boolean;
+    autoIdleHibernateMs: number;
+  };
 }
 
 export interface RuntimeStats {

@@ -36,7 +36,9 @@
     "copyright": "© 2026 MIT — wraps deepseek-ai/deepseek-harness",
     "targets": "all",
     "resources": [
-      "resources/dsh-runtime.cjs"
+      "resources/dsh-runtime.cjs",
+      "resources/dsh-node*",
+      "resources/node_modules/**/*"
     ],
     "icon": [
       "icons/32x32.png",

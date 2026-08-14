@@ -1,7 +1,90 @@
 import { RUNTIME_MODES } from "../types";
-import type { EventKind, PendingApproval, PluginInfo, RuntimeEvent, RuntimeMode, RuntimeStats, SessionSummary, UserSettings } from "../types";
+import type { EventKind, ModelConfig, PendingApproval, PluginInfo, RuntimeEvent, RuntimeMode, RuntimeStats, SessionSummary, UserSettings } from "../types";
 import type { ApprovalListener, EventListener, IRuntime } from "../IRuntime";
 import { inTauri } from "../../hooks/tauriNative";
+
+export interface ProviderProfile {
+  id: string;
+  label: string;
+  defaultBaseUrl?: string;
+  defaultApiKeyEnv: string;
+  recommendedModels: { id: string; displayName: string; maxContext?: number }[];
+}
+
+export const PROVIDER_PROFILES: ProviderProfile[] = [
+  {
+    id: "deepseek-official",
+    label: "DeepSeek 官方",
+    defaultBaseUrl: "https://api.deepseek.com/v1",
+    defaultApiKeyEnv: "DEEPSEEK_API_KEY",
+    recommendedModels: [
+      { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", maxContext: 128000 },
+      { id: "deepseek-v4", displayName: "DeepSeek V4", maxContext: 128000 },
+      { id: "deepseek-chat", displayName: "DeepSeek Chat (V3)", maxContext: 64000 },
+      { id: "deepseek-reasoner", displayName: "DeepSeek Reasoner (R1)", maxContext: 64000 },
+    ],
+  },
+  {
+    id: "openai-compatible",
+    label: "OpenAI 兼容（Azure / 硅基流动 / Together 等）",
+    defaultBaseUrl: "https://api.openai.com/v1",
+    defaultApiKeyEnv: "OPENAI_API_KEY",
+    recommendedModels: [
+      { id: "gpt-4o", displayName: "GPT-4o", maxContext: 128000 },
+      { id: "gpt-4o-mini", displayName: "GPT-4o Mini", maxContext: 128000 },
+      { id: "o3-mini", displayName: "o3 Mini", maxContext: 128000 },
+      { id: "o1", displayName: "o1", maxContext: 128000 },
+    ],
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic Claude",
+    defaultBaseUrl: "https://api.anthropic.com/v1",
+    defaultApiKeyEnv: "ANTHROPIC_API_KEY",
+    recommendedModels: [
+      { id: "claude-3-7-sonnet-20250219", displayName: "Claude 3.7 Sonnet", maxContext: 200000 },
+      { id: "claude-3-5-sonnet-20241022", displayName: "Claude 3.5 Sonnet (Oct 2024)", maxContext: 200000 },
+      { id: "claude-3-5-haiku-20241022", displayName: "Claude 3.5 Haiku", maxContext: 200000 },
+      { id: "claude-3-opus-20240229", displayName: "Claude 3 Opus", maxContext: 200000 },
+    ],
+  },
+  {
+    id: "google-gemini",
+    label: "Google Gemini",
+    defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    defaultApiKeyEnv: "GOOGLE_API_KEY",
+    recommendedModels: [
+      { id: "gemini-2.5-pro-exp-03-25", displayName: "Gemini 2.5 Pro (Experimental)", maxContext: 1000000 },
+      { id: "gemini-2.0-flash", displayName: "Gemini 2.0 Flash", maxContext: 1000000 },
+      { id: "gemini-1.5-pro", displayName: "Gemini 1.5 Pro", maxContext: 1000000 },
+      { id: "gemini-1.5-flash", displayName: "Gemini 1.5 Flash", maxContext: 1000000 },
+    ],
+  },
+  {
+    id: "ollama",
+    label: "Ollama 本地",
+    defaultBaseUrl: "http://localhost:11434/v1",
+    defaultApiKeyEnv: "OLLAMA_API_KEY",
+    recommendedModels: [
+      { id: "qwen2.5:7b", displayName: "Qwen 2.5 7B", maxContext: 128000 },
+      { id: "qwen2.5:14b", displayName: "Qwen 2.5 14B", maxContext: 128000 },
+      { id: "llama3.1:8b", displayName: "Llama 3.1 8B", maxContext: 128000 },
+      { id: "deepseek-r1:14b", displayName: "DeepSeek R1 14B", maxContext: 128000 },
+    ],
+  },
+];
+
+export const MODEL_PRESETS: ModelConfig[] = PROVIDER_PROFILES.flatMap((p) =>
+  p.recommendedModels.map((m, idx) => ({
+    provider: p.id,
+    modelId: m.id,
+    displayName: m.displayName,
+    apiKeyEnv: p.defaultApiKeyEnv,
+    baseUrl: p.defaultBaseUrl,
+    maxContext: m.maxContext,
+    enabled: idx === 0,
+  })),
+);
 
 type DshEventNotification = {
   method: string;
@@ -130,18 +213,10 @@ export class DshRuntime implements IRuntime {
   }
 
   private defaultUserSettings(): UserSettings {
+    const presets = MODEL_PRESETS;
     return {
       activeModel: "deepseek-official/deepseek-v4-flash",
-      models: [
-        {
-          provider: "deepseek-official",
-          modelId: "deepseek-v4-flash",
-          displayName: "DeepSeek V4 Flash",
-          apiKeyEnv: "DEEPSEEK_API_KEY",
-          maxContext: 128000,
-          enabled: true,
-        },
-      ],
+      models: presets,
       apiKeys: {},
       pluginsEnabled: {},
       temperature: 0.7,
@@ -151,6 +226,26 @@ export class DshRuntime implements IRuntime {
       toolApprovalAutoDeny: [],
       telemetry: false,
       theme: "dark",
+      appearance: {
+        accentColor: "#6366f1",
+        skin: "default",
+        fontFamily: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+        fontScale: 1.0,
+        sidebarDensity: "normal",
+        messageBubbles: true,
+      },
+      desktopPet: {
+        enabled: false,
+        avatar: "fox",
+        size: 140,
+        opacity: 0.95,
+        interactive: true,
+        mood: "idle",
+        position: { x: -1, y: -1 },
+        anchor: "bottom-right",
+        notifyOnEvents: true,
+        autoIdleHibernateMs: 5 * 60 * 1000,
+      },
     };
   }
 
@@ -250,7 +345,20 @@ export class DshRuntime implements IRuntime {
     plugins?: string[];
     settings?: Partial<UserSettings>;
   }): Promise<void> {
-    if (this.ready) return;
+    // --- Mode-switch / re-entry guard ---------------------------------------
+    // If start() is called *twice with the same mode* (e.g. UI component
+    // eagerly re-renders or boot() calls setMode immediately after boot())
+    // we short-circuit to a no-op so internal timers / subscriptions don't
+    // get double-installed.
+    if (this.ready && this.mode === mode) return;
+    // If start() is called with a DIFFERENT mode while we're still running
+    // (e.g. the UI clicked "Minimal" while Standard was live), treat it as
+    // a restart request — fully stop the current instance then re-enter
+    // this function with `ready === false` so the rest of the logic runs
+    // exactly once without ever missing the `this.mode = mode` write below.
+    if (this.ready) {
+      await this.stop();
+    }
     this.mode = mode;
     this.settings = { ...this.defaultUserSettings(), ...(overrides?.settings ?? {}) };
     const active =
@@ -260,15 +368,35 @@ export class DshRuntime implements IRuntime {
       (window as unknown as { __DSH_CWD__?: string }).__DSH_CWD__ ??
       (location.origin.startsWith("http") ? "/tmp/dsh-workspace" : ".");
 
+    // --- Pull API key from Keychain (if set) so SDK side can call the model.
+    //     If the user never stored a key we still pass undefined — SDK will
+    //     fall back to checking process-env like DEEPSEEK_API_KEY itself.
+    const apiKeyFromKeychain = active?.apiKeyEnv
+      ? await (async () => {
+          try {
+            const { secureGet } = await import("../../hooks/tauriNative");
+            return await secureGet(active.apiKeyEnv);
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+
     const { invoke } = await getTauri();
     void cwd;
-    try {
-      const extraSettings = overrides?.settings ?? {};
-      const userRuntimeCmd: string | undefined =
-        extraSettings.runtimeCmd ?? this.settings.runtimeCmd;
-      const userRuntimeArgs: string[] | undefined =
-        extraSettings.runtimeArgs ?? this.settings.runtimeArgs;
 
+    // These hoisted variables are READ by the catch{} block below for
+    // post-failure stale-settings auto-heal. Declaring them outside try { ... }
+    // keeps them in scope when the spawn error is thrown.
+    const extraSettings = overrides?.settings ?? {};
+    const userRuntimeCmd: string | undefined =
+      extraSettings.runtimeCmd ?? this.settings.runtimeCmd;
+    const userRuntimeArgs: string[] | undefined =
+      extraSettings.runtimeArgs ?? this.settings.runtimeArgs;
+    let qualifiedCmd = false;
+    let unconditionallyDrop = false;
+
+    try {
       // --- Stale-settings auto-healing ----------------------------------------
       // Ghost nvm installs (directory exists but bin/node is missing, or user
       // manually typed a path that went away) leave bad values cached in
@@ -287,18 +415,19 @@ export class DshRuntime implements IRuntime {
       // path looks broken, just STOP propagating it and let Rust resolver
       // pick a working binary.
       const PATH_SEP_RE = /[\\/]/;
-      const qualifiedCmd =
+      qualifiedCmd =
         typeof userRuntimeCmd === "string" &&
         userRuntimeCmd.length > 0 &&
         (userRuntimeCmd.startsWith("/") ||
           /^[A-Za-z]:[\\/]/.test(userRuntimeCmd) ||
           PATH_SEP_RE.test(userRuntimeCmd));
       // Rule of thumb: if the last component of a qualified path points to a
-      // file that literally mentions v26.7.0 and it's the same broken ghost
-      // install users keep hitting, drop it unconditionally. This one
-      // explicit carve-out is worth 3 rounds of "still the same error".
-      const KNOW_BAD_TOKEN_RE = /v26[./_-]7[./_-]0/;
-      const unconditionallyDrop =
+      // file that literally mentions one of these PROVEN ghost tokens (we've
+      // chased each of them across 3+ rounds of "still the same spawn os error
+      // 2" user reports), drop it unconditionally. Each explicit carve-out
+      // here is worth 3 rounds of back-and-forth.
+      const KNOW_BAD_TOKEN_RE = /(v26[./_-]7[./_-]0|v14[./_-]17[./_-]3)/;
+      unconditionallyDrop =
         typeof userRuntimeCmd === "string" && KNOW_BAD_TOKEN_RE.test(userRuntimeCmd);
       if (qualifiedCmd && !unconditionallyDrop) {
         // Can't fs.existsSync inside WebView, so we do the next-best thing:
@@ -341,6 +470,10 @@ export class DshRuntime implements IRuntime {
           model: active?.modelId ?? "deepseek-v4-flash",
           max_tokens: this.settings.maxTokens,
           maxTokens: this.settings.maxTokens,
+          base_url: active?.baseUrl,
+          baseUrl: active?.baseUrl,
+          api_key: apiKeyFromKeychain ?? undefined,
+          apiKey: apiKeyFromKeychain ?? undefined,
           plugins: overrides?.plugins ?? [],
           env: {},
           runtime_cmd: effectiveRuntimeCmd,
@@ -403,6 +536,41 @@ export class DshRuntime implements IRuntime {
       const legacyHint = /missing required key params/i.test(raw)
         ? " (legacy-hint: this exact error string only appears with Rust shells < v0.1.3; quit the app, download the latest v0.1.3+ dmg/exe from the GitHub Releases page and overwrite the installed copy.)"
         : "";
+
+      // --- Generic stale-settings auto-heal for any qualified-path spawn failure --
+      // If the user came in with a manually-set qualified runtimeCmd and the
+      // Rust shell immediately failed with ENOENT / no such file / os error 2,
+      // that cached path is dead — delete it from UserSettings now so the next
+      // start() call immediately uses the clean basename path and lets Rust
+      // resolver run P1 (PATH) / P2 (static locations) unpoisoned.
+      //
+      // Critically we only wipe if the error is a spawn-level ENOENT — never
+      // wipe on permission denied / wrong arch / tsx missing where the user
+      // intent (a specific binary) is still valid but something else is
+      // broken.
+      const spawnedQualifiedENOENT =
+        qualifiedCmd &&
+        !unconditionallyDrop &&
+        /(no such file|os error 2|ENOENT)/i.test(raw) &&
+        /failed to spawn dsh runtime/i.test(raw);
+      if (spawnedQualifiedENOENT && typeof userRuntimeCmd === "string") {
+        const staleCmd = userRuntimeCmd;
+        try {
+          if (this.settings!.runtimeCmd === staleCmd) {
+            this.settings!.runtimeCmd = undefined;
+          }
+          if (extraSettings.runtimeCmd === staleCmd) {
+            (extraSettings as Record<string, unknown>).runtimeCmd = undefined;
+          }
+          await this.updateSettings({ runtimeCmd: undefined, runtimeArgs: undefined });
+        } catch {
+          /* ignore persistence errors; user-facing error is primary */
+        }
+        // Append a one-line breadcrumb so users can tell why we stopped using
+        // their old cached path without reading this source file.
+        const cleared = ` (auto-heal: removed stale cached Runtime Command "${staleCmd}" from Settings; next start will scan PATH for the default "node" binary. To force a specific binary, open Settings → Runtime → Runtime Command and paste a fresh absolute path.)`;
+        throw new Error(`DSH SDK bridge start failed: ${raw}.${tip}${legacyHint}${cleared}`);
+      }
 
       throw new Error(`DSH SDK bridge start failed: ${raw}.${tip}${legacyHint}`);
     }

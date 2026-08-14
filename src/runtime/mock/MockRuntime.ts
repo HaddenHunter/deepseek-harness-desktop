@@ -40,6 +40,26 @@ const DEFAULT_SETTINGS: UserSettings = {
   toolApprovalAutoDeny: ["shell:rm -rf"],
   telemetry: false,
   theme: "dark",
+  appearance: {
+    accentColor: "#6366f1",
+    skin: "default",
+    fontFamily: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+    fontScale: 1.0,
+    sidebarDensity: "normal",
+    messageBubbles: true,
+  },
+  desktopPet: {
+    enabled: false,
+    avatar: "fox",
+    size: 140,
+    opacity: 0.95,
+    interactive: true,
+    mood: "idle",
+    position: { x: -1, y: -1 },
+    anchor: "bottom-right",
+    notifyOnEvents: true,
+    autoIdleHibernateMs: 5 * 60 * 1000,
+  },
 };
 
 const MOCK_PLUGINS: PluginInfo[] = [
@@ -79,7 +99,11 @@ export class MockRuntime implements IRuntime {
   private toolsExecuted = 0;
 
   async start(mode: RuntimeMode, overrides?: { plugins?: string[]; settings?: Partial<UserSettings> }): Promise<void> {
-    if (this.ready) return;
+    if (this.ready && this.mode === mode) return;
+    if (this.ready) {
+      // UI clicked a different mode; treat as restart.
+      await this.stop();
+    }
     this.mode = mode;
     this.startedAt = Date.now();
     const modeCfg = RUNTIME_MODES.find((m) => m.id === mode)!;

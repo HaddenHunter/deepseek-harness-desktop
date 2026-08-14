@@ -1,7 +1,12 @@
 import { create } from "zustand";
+import { shallow } from "zustand/shallow";
 import type { IRuntime } from "@/runtime/IRuntime";
 import type { PendingApproval, PluginInfo, RuntimeEvent, RuntimeMode, RuntimeStats, SessionSummary, UserSettings } from "@/runtime/types";
 import { RUNTIME_MODES } from "@/runtime/types";
+
+// Re-export for consumers that want stable selector comparisons across
+// components without having to import zustand themselves.
+export { shallow };
 
 export type ViewName = "chat" | "settings" | "plugins" | "approvals" | "about";
 
@@ -25,6 +30,12 @@ export interface UIState {
   generating: boolean;
   lastError: string | null;
   rightPanel: "trajectory" | "tool" | null;
+
+  // RAF-batching internals — consumers MUST NOT read directly.
+  readonly _evBuffer: RuntimeEvent[];
+  readonly _evRaf: ReturnType<typeof requestAnimationFrame> | 0;
+  readonly _apprBuffer: Map<string, PendingApproval>;
+  readonly _apprRaf: ReturnType<typeof requestAnimationFrame> | 0;
 }
 
 export interface UIActions {
@@ -53,7 +64,9 @@ export interface UIActions {
   toggleSidebar: (v?: boolean) => void;
   setRightPanel: (p: UIState["rightPanel"]) => void;
   clearError: () => void;
+  _flushEventBuffer: () => void;
   _pushEvent: (ev: RuntimeEvent) => void;
+  _flushApprovalBuffer: () => void;
   _pushApproval: (a: PendingApproval) => void;
 }
 
@@ -79,10 +92,24 @@ const INITIAL: UIState = {
   generating: false,
   lastError: null,
   rightPanel: "trajectory",
+  _evBuffer: [],
+  _evRaf: 0,
+  _apprBuffer: new Map(),
+  _apprRaf: 0,
 };
 
 export const useUIStore = create<UIStore>((set, get) => ({
   ...INITIAL,
+
+  /* ---------------------- Batching internals ----------------------
+   * All per-event/per-approval pushes accumulate here. A single RAF
+   * coalesces 10–200 events/sec into 1 set() call per animation frame,
+   * collapsing N React renders into 1.
+   */
+  _evBuffer: [] as RuntimeEvent[],
+  _evRaf: 0 as unknown as ReturnType<typeof requestAnimationFrame> | 0,
+  _apprBuffer: new Map<string, PendingApproval>(),
+  _apprRaf: 0 as unknown as ReturnType<typeof requestAnimationFrame> | 0,
 
   async boot(runtime, kind) {
     try {
@@ -108,13 +135,66 @@ export const useUIStore = create<UIStore>((set, get) => ({
     }
   },
 
+  /* ---------------- Event batching (biggest single perf win) ----------------
+   *
+   * SDK streams evs at ~10–200/s during tool-heavy runs. Naively re-rendering
+   * the entire chat list per event produces visible jank. Instead we collect
+   * events for up to `BATCH_MS` and flush them once per animation frame,
+   * which collapses N re-renders into 1.
+   */
   async setMode(mode) {
-    const rt = get().runtime;
+    const prev = get();
+    const rt = prev.runtime;
     if (!rt) return;
-    await rt.stop();
-    await rt.start(mode);
+    if (prev.mode === mode) return; // same mode, nothing to do.
+
+    // UI-level busy indicator: show switching animation until setMode promise resolves
+    // (Sidebar component reads via its own local switching state too; this
+    //  block is intentionally tolerant of double-clicks / React StrictMode
+    //  double-invoke where start() itself now handles mode equality guard.)
+    try {
+      await rt.stop();
+      await rt.start(mode);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      set({ lastError: `切换运行模式失败：${msg}` });
+      // If the switch failed, make sure the store reflects actual runtime
+      // reality instead of a stale pending mode (prevents UI from
+      // incorrectly highlighting the target mode when runtime is still the
+      // old one).
+      if (rt.isReady()) {
+        const actualMode = rt.currentMode();
+        if (actualMode) {
+          set({ mode: actualMode });
+          return;
+        }
+      }
+      // If runtime is not ready after a failed stop+start, leave mode=prev.mode
+      // so the sidecar "highlighted active mode" stays consistent with reality.
+      set({ mode: prev.mode });
+      return;
+    }
     set({ mode });
-    await Promise.all([get().refreshStats(), get().refreshPlugins()]);
+    // refreshSessions is important: DshRuntime.stop() clears the frontend
+    // sessions map, so after restart we MUST re-list for the sidebar to
+    // populate correctly.
+    try {
+      await Promise.all([
+        get().refreshSessions(),
+        get().refreshStats(),
+        get().refreshPlugins(),
+      ]);
+      if (!get().activeSessionId) {
+        await get().createSession(mode);
+      } else {
+        // Re-hydrate events for the currently selected session so messages
+        // don't visually "disappear" across a mode switch.
+        try { await get().selectSession(get().activeSessionId); } catch { /* ignore */ }
+      }
+    } catch {
+      // Post-switch session refresh failure is non-fatal; the user can still
+      // click around to make data appear.
+    }
   },
 
   async refreshStats() {
@@ -279,20 +359,53 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ lastError: null });
   },
 
-  _pushEvent(ev) {
+  _flushEventBuffer() {
     const s = get();
-    if (ev.sessionId !== s.activeSessionId) {
-      void s.refreshSessions();
+    const buffer = s._evBuffer;
+    if (buffer.length === 0) {
+      set({ _evRaf: 0 });
       return;
     }
-    const next = [...s.events, ev];
-    const generating = next.some(
-      (e) => (e.kind === "assistant_thinking" || e.kind === "tool_call") && !next.some((x) => x.kind === "assistant_message" && x.ts > e.ts),
+    const activeId = s.activeSessionId;
+    let events = s.events;
+    const newOnes: RuntimeEvent[] = [];
+    let crossSession = false;
+    for (const ev of buffer) {
+      if (ev.sessionId !== activeId) { crossSession = true; continue; }
+      newOnes.push(ev);
+    }
+    if (newOnes.length) events = [...events, ...newOnes];
+    const generating = events.some(
+      (e) => (e.kind === "assistant_thinking" || e.kind === "tool_call") &&
+        !events.some((x) => x.kind === "assistant_message" && x.ts > e.ts),
     );
-    set({ events: next, generating });
+    set({ _evBuffer: [], _evRaf: 0, events, generating });
+    if (crossSession) void s.refreshSessions();
+  },
+
+  _pushEvent(ev) {
+    const s0 = get();
+    s0._evBuffer.push(ev);
+    if (s0._evRaf) return;
+    const handle = requestAnimationFrame(() => get()._flushEventBuffer());
+    set({ _evRaf: handle });
+  },
+
+  _flushApprovalBuffer() {
+    const s = get();
+    const buf = s._apprBuffer;
+    if (buf.size === 0) { set({ _apprRaf: 0 }); return; }
+    const existing = new Map(s.approvals.map((a) => [a.toolCallId, a] as const));
+    for (const [id, a] of buf.entries()) existing.set(id, a);
+    buf.clear();
+    set({ _apprBuffer: buf, _apprRaf: 0, approvals: Array.from(existing.values()) });
   },
 
   _pushApproval(a) {
-    set((s) => ({ approvals: [...s.approvals.filter((x) => x.toolCallId !== a.toolCallId), a] }));
+    const s0 = get();
+    s0._apprBuffer.set(a.toolCallId, a);
+    if (s0._apprRaf) return;
+    const handle = requestAnimationFrame(() => get()._flushApprovalBuffer());
+    set({ _apprRaf: handle });
   },
 }));
