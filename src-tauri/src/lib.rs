@@ -95,17 +95,39 @@ fn new_req_id() -> String {
 /// If the user asked for a bare name like "node", try common install locations
 /// so the sidecar still resolves without the user explicitly exporting DSH_RUNTIME_CMD.
 ///
-/// The resolver does THREE layers of verification, not just "file exists":
-///   1. metadata().is_file()           — actually exists and is a regular file
-///   2. is_executable()               — has +x on unix or is .exe/.com on windows
-///   3. spawn it with `-e 0` + 3s timeout — really runs (catches arch mismatches,
-///      partial nvm installs, broken shims, Rosetta failures, etc.)
-/// Candidates are accumulated in priority order, and the FIRST one that passes
-/// ALL three checks wins.
+/// Selection algorithm (fully ordered, deterministic, zero ambiguity):
+///
+///   [P0] EXPLICIT USER PATH. If the caller passed an absolute/qualified cmd
+///        (e.g. DSH_RUNTIME_CMD=/bad/nvm/v26.7.0/bin/node), probe it FIRST.
+///        If it works → great, honour user intent. If it fails (ENOENT, wrong
+///        arch, broken symlink, no +x), discard it silently and continue the
+///        search — we never return a path we have already proven will crash
+///        at spawn time.
+///
+///   [P1] INHERITED PATH. Walk every PATH entry and look for the base binary
+///        name ("node" / "node.exe"). This is what shells do. Critically we
+///        search by BASE NAME, never by the raw `cmd` string, so an absolute
+///        bad path does not poison the entire PATH scan (the old impl did
+///        dir.join(cmd) where cmd was absolute, resulting in the bad path
+///        repeated N times with zero real lookups performed).
+///
+///   [P2] STATIC POPULAR LOCATIONS (/opt/homebrew/bin/node, nvm_dir/versions,
+///        fnm installations, etc.) sorted with newest/most-likely-first so
+///        the first probe hit wins.
+///
+///   [P3] FINAL FALLBACK. If nothing probed successfully, return the ORIGINAL
+///        cmd string so the spawn error names exactly what the user typed.
+///
+/// Every candidate that passes the cheap metadata gate goes through
+/// try_probe(), which actually spawns `<candidate> -e 0` and demands exit 0
+/// within 3s.  try_probe is the SOURCE OF TRUTH — metadata gates are only a
+/// fast-path skip for 100% impossible candidates (dirs, empty PATH entries,
+/// missing files).
 fn resolve_runtime_binary(cmd: &str) -> String {
     use std::path::{Path, PathBuf};
 
-    fn is_executable(p: &Path) -> bool {
+    // --- helpers ---------------------------------------------------------
+    fn is_executable(p: &Path) -> bool { /* unchanged */
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -124,10 +146,7 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         }
     }
 
-    // Try running a candidate with `node -e 0` (valid JavaScript). Returns true
-    // iff it exits 0 within 3 seconds. For non-node binaries (if the user
-    // pointed DSH_RUNTIME_CMD at a native launcher), we still trust existence.
-    fn try_probe(p: &Path) -> bool {
+    fn try_probe(p: &Path) -> bool { /* unchanged */
         let is_node = p
             .file_name()
             .and_then(|s| s.to_str())
@@ -136,10 +155,6 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         if !is_node {
             return true;
         }
-
-        // Always use std::process + thread-based polling. This keeps probe fully
-        // independent of whether we're inside a tokio runtime and avoids
-        // block_on/block_in_place method drift across tokio versions.
         let mut child = match std::process::Command::new(p)
             .arg("-e")
             .arg("0")
@@ -162,51 +177,49 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         false
     }
 
-    // If absolute or already has a path separator or file extension:
-    //   * if it passes probe, trust the user's explicit choice;
-    //   * otherwise FALL THROUGH to the candidate search so we still find a
-    //     working Node, never returning a path that os-error-2s on spawn.
-    let path = Path::new(cmd);
-    if path.is_absolute()
-        || cmd.contains('/')
-        || cmd.contains('\\')
-        || cmd.ends_with(".exe")
-    {
-        if path.is_file() && is_executable(path) && try_probe(path) {
-            return cmd.to_string();
-        }
-        // Fall through — do NOT early-return a known-bad path.
+    fn base_name(cmd: &str) -> String {
+        // Strip any path components, keep just the executable basename.
+        // For "node" returns "node". For "/bad/v26.7.0/bin/node" returns "node".
+        // For "C:\\Program Files\\nodejs\\node.exe" returns "node.exe".
+        let by_slash = cmd.rsplit('/').next().unwrap_or(cmd);
+        let by_backslash = by_slash.rsplit('\\').next().unwrap_or(by_slash);
+        by_backslash.to_string()
     }
 
-    // Collect all candidates in priority order.
-    let mut candidates: Vec<PathBuf> = vec![];
-
-    // Z) If the user explicitly gave us a path (case above) that failed probe,
-    //    still leave it as the LAST candidate so the final error message can
-    //    show the exact path the user asked for, instead of a random one from
-    //    the system. We'll try it one last time before giving up.
-    let explicit_user_candidate: Option<PathBuf> = if path.is_absolute()
+    // --- Determine if user supplied a qualified path --------------------
+    let path = Path::new(cmd);
+    let is_qualified = path.is_absolute()
         || cmd.contains('/')
         || cmd.contains('\\')
-        || cmd.ends_with(".exe")
-    {
-        Some(path.to_path_buf())
+        || cmd.ends_with(".exe");
+
+    // --- Build candidate list in strict priority order ------------------
+    let mut candidates: Vec<PathBuf> = vec![];
+
+    // P0 — the raw user-supplied cmd (if qualified). Probe it first so we
+    // honour DSH_RUNTIME_CMD overrides when they actually work.
+    if is_qualified {
+        candidates.push(path.to_path_buf());
+    }
+
+    let base = base_name(cmd);
+    let base_exe = if cfg!(windows) && !base.eq_ignore_ascii_case("exe") {
+        format!("{base}.exe")
     } else {
-        None
+        base.clone()
     };
 
-    // A) PATH-derived candidates (process-inherited order)
+    // P1 — inherited PATH walk, using BASE NAME only.
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            candidates.push(dir.join(cmd));
-            #[cfg(windows)]
-            {
-                candidates.push(dir.join(format!("{cmd}.exe")));
+            candidates.push(dir.join(&base));
+            if cfg!(windows) && base != base_exe {
+                candidates.push(dir.join(&base_exe));
             }
         }
     }
 
-    // B) Hand-curated popular static locations
+    // P2a — static popular absolute locations (Unix)
     #[cfg(unix)]
     for p in [
         "/opt/homebrew/bin/node",
@@ -222,6 +235,7 @@ fn resolve_runtime_binary(cmd: &str) -> String {
     ] {
         candidates.push(PathBuf::from(p));
     }
+    // P2a — static popular absolute locations (Windows)
     #[cfg(windows)]
     for p in [
         r"C:\Program Files\nodejs\node.exe",
@@ -230,26 +244,33 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         candidates.push(PathBuf::from(p));
     }
 
-    // C) nvm: versions sorted newest-first so user's latest installed wins,
-    //    but only after PATH static dirs (we prefer system/brew-wide installs
-    //    that are more likely to be present across archs).
+    // P2b — nvm versions, sorted newest first.
     let nvm_default = std::env::var("HOME").map(|home| format!("{home}/.nvm"));
     if let Ok(nvm) = std::env::var("NVM_DIR").or_else(|_| nvm_default.clone()) {
         if let Ok(entries) = std::fs::read_dir(format!("{nvm}/versions/node")) {
-            let mut versions: Vec<_> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+            let mut versions: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
             versions.sort();
-            versions.reverse(); // newest first
-            for v in versions {
-                candidates.push(v.join("bin").join("node"));
+            versions.reverse();
+            #[cfg(unix)]
+            for v in &versions {
+                candidates.push(v.join("bin").join(&base));
+            }
+            #[cfg(windows)]
+            for v in &versions {
+                candidates.push(v.join(&base_exe));
             }
         }
     }
     #[cfg(windows)]
     if let Ok(appdata) = std::env::var("APPDATA") {
-        candidates.push(PathBuf::from(format!("{appdata}\\npm\\node.exe")));
+        candidates.push(PathBuf::from(format!("{appdata}\\npm\\{base_exe}")));
     }
 
-    // D) fnm
+    // P2c — fnm versions, sorted newest first.
     if let Ok(fnm_dir) = std::env::var("FNM_DIR")
         .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.fnm")))
     {
@@ -262,54 +283,60 @@ fn resolve_runtime_binary(cmd: &str) -> String {
             versions.sort();
             versions.reverse();
             #[cfg(unix)]
-            for v in versions {
-                candidates.push(v.join("installation").join("bin").join("node"));
+            for v in &versions {
+                candidates.push(v.join("installation").join("bin").join(&base));
             }
             #[cfg(windows)]
-            for v in versions {
-                candidates.push(v.join("installation").join("node.exe"));
+            for v in &versions {
+                candidates.push(v.join("installation").join(&base_exe));
             }
         }
     }
 
-    // Run verification against each candidate. For robustness:
-    //   1. `try_probe()` is the SOURCE OF TRUTH. It actually spawns the binary
-    //      with `-e 0` and checks exit 0 within 3s. This catches: broken
-    //      symlinks, wrong-arch binaries (even if metadata says it's a file +
-    //      +x), partial nvm installs, Rosetta crashes, missing runtime
-    //      libraries.
-    //   2. `is_file()` + `is_executable()` are ONLY used as a fast-path SKIP
-    //      for candidates that clearly don't exist (e.g. empty PATH entries),
-    //      to avoid 100s of spurious spawn calls.
-    for c in candidates {
-        let c_str = c.to_string_lossy().into_owned();
-        let md = std::fs::metadata(&c).ok();
-        // Fast-skip candidates that do not exist at all (file not found).
-        // We MUST NOT skip on !is_file() alone — dangling symlinks (like a
-        // broken nvm install that left a `bin/node -> /nothing` symlink) have
-        // metadata() fail entirely, so they fall into `None` below, and we
-        // still skip cheaply. If metadata() succeeds but points to a broken
-        // symlink (unlikely) or wrong-arch binary, spawn will error promptly.
+    // --- Walk candidates. Cheap metadata gate → full spawn probe --------
+    let mut chosen: Option<PathBuf> = None;
+    for c in candidates.iter() {
+        let md = std::fs::metadata(c).ok();
+        // Metadata says: missing file / broken symlink (None), or not a file
+        // → fast-skip. Everything plausible gets the real spawn probe.
         let skip_fast = match &md {
-            None => true,                    // No such file or broken symlink → skip
-            Some(m) if !m.is_file() => true, // Dir/socket/fifo → not a binary
-            Some(_) => false,                // Real regular file → run try_probe
+            None => true,
+            Some(m) if !m.is_file() => true,
+            Some(_) => false,
         };
         if skip_fast {
             continue;
         }
-        if try_probe(&c) {
-            return c_str;
+        // is_executable check: still cheap, avoids probing readme.txt files.
+        if !is_executable(c) {
+            continue;
+        }
+        if try_probe(c) {
+            chosen = Some(c.clone());
+            break;
         }
     }
-    if let Some(explicit) = explicit_user_candidate {
-        // User insisted on this path — even though it didn't pass probe, the
-        // error message will show exactly what they typed + OS details.
-        return explicit.to_string_lossy().into_owned();
-    }
 
-    // Nothing found. Return original so downstream errors say "node" literally.
-    cmd.to_string()
+    // Emit info so Console.app / log stream can tell us what was picked.
+    // Users chasing "why did it pick v26.7.0 again?" can grep this line.
+    match &chosen {
+        Some(p) => {
+            eprintln!(
+                "[dsh-resolver] input={:?} -> selected={:?} (from {} candidates, first probe-hit)",
+                cmd, p, candidates.len()
+            );
+            p.to_string_lossy().into_owned()
+        }
+        None => {
+            eprintln!(
+                "[dsh-resolver] input={:?} -> NO candidate probed successfully (scanned {} candidates). Spawn will use the raw input and likely fail with os error.",
+                cmd, candidates.len()
+            );
+            // Final fallback: return the original string so spawn error names
+            // exactly what the user typed (not "node").
+            cmd.to_string()
+        }
+    }
 }
 
 #[derive(Copy, Clone, Serialize)]
@@ -677,6 +704,23 @@ async fn dsh_start(
         .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>());
     let args = runtime_args.or(args_env).unwrap_or(default_args);
 
+    // --- Resolver transparent log: why did we pick THIS binary? ---
+    // Users chasing "why is it still trying v26.7.0?" can grep either the Tauri
+    // stderr stream in Console.app or the dsh://notification log channel.
+    eprintln!(
+        "[dsh-start] spawn-intent cmd={:?} cwd={:?} args.len={} args={:?}",
+        &cmd, &cwd, args.len(), &args
+    );
+    emit_log(
+        &app,
+        LogLevel::Info,
+        &format!(
+            "[dsh-start] resolved runtime cmd={cmd:?} cwd={cwd:?} args({})=[{:?}]",
+            args.len(),
+            &args
+        ),
+    );
+
     let mut child_env: HashMap<String, String> = std::env::vars().collect();
     child_env.insert("DSH_PROFILE".into(), mode.clone());
     if !plugins.is_empty() {
@@ -686,12 +730,6 @@ async fn dsh_start(
         child_env.insert(k, v);
     }
     child_env.insert("DSH_JSONRPC_IO".into(), "stdio".into());
-
-    emit_log(
-        &app,
-        LogLevel::Info,
-        &format!("spawning dsh-runtime: {cmd} {}", args.join(" ")),
-    );
 
     let mut child = Command::new(&cmd)
         .args(&args)
