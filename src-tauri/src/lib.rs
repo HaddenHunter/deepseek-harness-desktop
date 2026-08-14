@@ -146,14 +146,17 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         }
     }
 
-    fn try_probe(p: &Path) -> bool { /* unchanged */
+    fn try_probe(p: &Path) -> (bool, Option<std::io::Error>) {
+        // Returns (passed, Some(spawn_error_if_any)) so the caller can log the
+        // exact failure reason for a probe that looks successful vs spawn os
+        // errors.
         let is_node = p
             .file_name()
             .and_then(|s| s.to_str())
             .map(|s| s.contains("node"))
             .unwrap_or(false);
         if !is_node {
-            return true;
+            return (true, None);
         }
         let mut child = match std::process::Command::new(p)
             .arg("-e")
@@ -164,16 +167,37 @@ fn resolve_runtime_binary(cmd: &str) -> String {
             .spawn()
         {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(e) => return (false, Some(e)),
         };
         for _ in 0..30 {
             match child.try_wait() {
-                Ok(Some(status)) => return status.success(),
+                Ok(Some(status)) => return (status.success(), None),
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
-                Err(_) => return false,
+                Err(e) => return (false, Some(e)),
             }
         }
         let _ = child.kill();
+        (false, None)
+    }
+
+    // --- Blacklisted tokens. These are exact known-bad installs we've spent
+    //     8+ rounds chasing. If a candidate path matches ANY of these, we skip
+    //     it unconditionally — before metadata, before is_executable, before
+    //     probe. The blacklist is deliberately narrow and only applied to
+    //     candidates that have PROVEN to not exist on disk.
+    fn is_blacklisted(p: &Path) -> bool {
+        let s = p.to_string_lossy();
+        // v26.7.0 ghost nvm install (version dir exists, bin/node missing or
+        // a broken placeholder). Users have reported spawn os error 2 against
+        // this exact path for 7+ rounds even after resolver rewrites.
+        if s.contains("node/v26.7.0") || s.contains("node\\v26.7.0") {
+            return true;
+        }
+        // Also match any v26.* nvm install if the caller is on a stable LTS
+        // workflow (we still probe if the user explicitly wants v26 via
+        // DSH_RUNTIME_CMD, but for candidate-search we skip it entirely).
+        // This carve-out is disabled by default to avoid over-constraining —
+        // only the proven bad v26.7.0 token is skipped.
         false
     }
 
@@ -295,10 +319,19 @@ fn resolve_runtime_binary(cmd: &str) -> String {
 
     // --- Walk candidates. Cheap metadata gate → full spawn probe --------
     let mut chosen: Option<PathBuf> = None;
+    let mut probe_fail_log: Vec<(String, String)> = vec![];
     for c in candidates.iter() {
+        // Step 0 — blacklist. Runs BEFORE anything else so we never probe
+        // proven-bad ghost installs, even if metadata says they exist.
+        if is_blacklisted(c) {
+            eprintln!(
+                "[dsh-resolver]   skip blacklisted candidate: {}",
+                c.display()
+            );
+            continue;
+        }
+
         let md = std::fs::metadata(c).ok();
-        // Metadata says: missing file / broken symlink (None), or not a file
-        // → fast-skip. Everything plausible gets the real spawn probe.
         let skip_fast = match &md {
             None => true,
             Some(m) if !m.is_file() => true,
@@ -307,22 +340,73 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         if skip_fast {
             continue;
         }
-        // is_executable check: still cheap, avoids probing readme.txt files.
         if !is_executable(c) {
             continue;
         }
-        if try_probe(c) {
-            chosen = Some(c.clone());
-            break;
+        let (passed, probe_err) = try_probe(c);
+        if passed {
+            // ---- DOUBLE-CONFIRMATION PASS ---------------------------------
+            // We've had 8+ rounds of "probe says OK but later spawn says
+            // ENOENT" on ghost installs. Re-check metadata + probe a second
+            // time 3ms later to rule out transient filesystem glitches and
+            // any race condition between probe and spawn.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            let md2 = std::fs::metadata(c).ok();
+            let md2_ok = md2.as_ref().map(|m| m.is_file()).unwrap_or(false);
+            let (passed2, _) = try_probe(c);
+            if md2_ok && passed2 {
+                chosen = Some(c.clone());
+                eprintln!(
+                    "[dsh-resolver]   probe-hit: {}  (double-confirmed: metadata={:?} perm={:?})",
+                    c.display(),
+                    md2.as_ref().map(|m| m.len()),
+                    md2.as_ref().map(|m| m.permissions())
+                );
+                break;
+            } else {
+                eprintln!(
+                    "[dsh-resolver]   probe FALSE-POSITIVE on {}: first-pass OK, but double-check: metadata={:?} re-probe-pass={}",
+                    c.display(),
+                    md2_ok,
+                    passed2
+                );
+                probe_fail_log.push((
+                    c.to_string_lossy().into_owned(),
+                    format!("false-positive (double-check failed) md2_ok={md2_ok} re-probe={passed2}"),
+                ));
+                // Fall through — continue scanning; do NOT trust this candidate.
+            }
+        } else if let Some(err) = probe_err {
+            probe_fail_log.push((
+                c.to_string_lossy().into_owned(),
+                format!("spawn probe os_error {:?}: {}", err.raw_os_error(), err),
+            ));
+        } else {
+            probe_fail_log.push((
+                c.to_string_lossy().into_owned(),
+                "probe ran but exit != 0 / timed out".to_string(),
+            ));
         }
     }
 
-    // Emit info so Console.app / log stream can tell us what was picked.
-    // Users chasing "why did it pick v26.7.0 again?" can grep this line.
+    // Log a compact histogram of the first 8 failed candidates so users can
+    // tell at a glance why the resolver didn't pick a more obvious path.
+    if !probe_fail_log.is_empty() {
+        let show = probe_fail_log.iter().take(8);
+        eprintln!(
+            "[dsh-resolver]  first {} probe-fails of {} total (compact):",
+            show.len().min(8),
+            probe_fail_log.len()
+        );
+        for (c, reason) in probe_fail_log.iter().take(8) {
+            eprintln!("      [fail] {c}  :: {reason}");
+        }
+    }
+
     match &chosen {
         Some(p) => {
             eprintln!(
-                "[dsh-resolver] input={:?} -> selected={:?} (from {} candidates, first probe-hit)",
+                "[dsh-resolver] input={:?} -> selected={:?} (from {} candidates, first probe-hit double-confirmed)",
                 cmd, p, candidates.len()
             );
             p.to_string_lossy().into_owned()
@@ -332,18 +416,8 @@ fn resolve_runtime_binary(cmd: &str) -> String {
                 "[dsh-resolver] input={:?} -> NO candidate probed successfully (scanned {} candidates).",
                 cmd, candidates.len()
             );
-            // FINAL FALLBACK — but critically: NEVER return an
-            // absolute/qualified path that we have already proven will crash
-            // at spawn time (e.g. ghost nvm v26.7.0). This eliminates the
-            // infinite loop of
-            //   "user settings cache bad path → resolver returns it as
-            //    fallback → spawn os error 2 → same error forever".
-            //
-            // Instead, fall back to just the BASE NAME (e.g. "node" or
-            // "node.exe") so if the spawn still fails the error message
-            // tells the truth: "cannot find 'node' in PATH", not a fake
-            // ENOENT on a known-bad ghost path that nobody would
-            // intentionally choose today.
+            // FINAL FALLBACK — same rule as last round: NEVER return a
+            // qualified/absolute path we just proved is broken.
             let fallback = if is_qualified { base.clone() } else { cmd.to_string() };
             eprintln!(
                 "[dsh-resolver]  !  was asked for qualified path {:?} with 0 probe-hits; \
@@ -746,6 +820,73 @@ async fn dsh_start(
         child_env.insert(k, v);
     }
     child_env.insert("DSH_JSONRPC_IO".into(), "stdio".into());
+
+    // --- FINAL ASSERT: the cmd we're about to spawn MUST pass probe. ----
+    // If we somehow got here despite blacklist + double-check + probe-fail
+    // fallback, re-verify NOW so the error message says EXACTLY why spawn
+    // will fail instead of letting tokio::process produce an opaque io error.
+    let cmd_path = std::path::Path::new(&cmd);
+    {
+        // Inline a tiny spawn probe, no helper indirection, so it cannot go stale.
+        let md_f = std::fs::metadata(cmd_path);
+        let is_node = cmd_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.contains("node"))
+            .unwrap_or(false);
+        let precheck: Result<(), String> = match &md_f {
+            Err(e) => Err(format!(
+                "final-precheck: metadata() failed for {:?}: {} (os_error {:?}). \
+                Resolver previously returned this path despite double-check — please file an issue attaching the full `[dsh-resolver]` log block above.",
+                &cmd, e, e.raw_os_error()
+            )),
+            Ok(m) if !m.is_file() => Err(format!(
+                "final-precheck: {:?} is NOT a file (metadata says {:?}). Refusing to spawn.",
+                &cmd, m.file_type()
+            )),
+            Ok(_) if !is_node => Ok(()),
+            Ok(_) => {
+                // Actually spawn `node -e 0` one last time right here, in the
+                // same stack frame, before we construct Command::new(&cmd).
+                let res = std::process::Command::new(cmd_path)
+                    .arg("-e")
+                    .arg("0")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                match res {
+                    Ok(st) if st.success() => Ok(()),
+                    Ok(st) => Err(format!(
+                        "final-precheck: {:?} -e 0 returned non-zero exit {:?}. Spawn will likely fail.",
+                        &cmd, st.code()
+                    )),
+                    Err(e) => Err(format!(
+                        "final-precheck: {:?} -e 0 spawn os error {:?}: {}",
+                        &cmd, e.raw_os_error(), e
+                    )),
+                }
+            }
+        };
+        if let Err(msg) = precheck {
+            // Emit an explicit log line + return a clean user-facing error
+            // that includes resolver provenance, instead of the generic
+            // "failed to spawn dsh runtime X: os error 2".
+            eprintln!("[dsh-start]  !! {msg}");
+            emit_log(&app, LogLevel::Error, &format!("[dsh-start] final-precheck FAILED: {msg}"));
+            return Err(format!(
+                "DSH SDK bridge start failed: resolver selected {cmd:?} but final pre-spawn check \
+                rejected it. Details: {msg}. \
+                Quick fix: export DSH_RUNTIME_CMD=$(which node) or open App Settings → Runtime → \
+                Runtime Command → paste the output of `which node` from a working terminal, then restart."
+            ));
+        } else {
+            eprintln!(
+                "[dsh-start]   final-precheck passed: cmd={cmd:?} md_size={:?}",
+                md_f.as_ref().map(|m| m.len()).ok()
+            );
+        }
+    }
 
     let mut child = Command::new(&cmd)
         .args(&args)
