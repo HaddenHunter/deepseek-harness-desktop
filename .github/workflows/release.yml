@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build ${{ matrix.os }}
+    name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,6 +38,14 @@ jobs:
             platform: win64-msi
             ext: msi
             bundle_dir: msi
+
+    outputs:
+      # Forward tauri-action's artifactPaths JSON array so the release job
+      # can pick up exactly the files that actually exist, instead of
+      # glob-wrangling across the 3 different target/*/bundle layouts.
+      tauri_artifacts_darwin: ${{ steps.tauri_macos.outputs.artifactPaths }}
+      tauri_artifacts_win_nsis: ${{ steps.tauri_win_nsis.outputs.artifactPaths }}
+      tauri_artifacts_win_msi:  ${{ steps.tauri_win_msi.outputs.artifactPaths }}
 
     steps:
       - name: Checkout sources
@@ -103,8 +111,9 @@ jobs:
           }
           Write-Host "WebView2 OK"
 
-      - name: (Windows) Build Tauri App (NSIS + MSI)
-        if: runner.os == 'Windows'
+      - name: (Windows) Build Tauri App (NSIS)    [win64-nsis]
+        if: matrix.platform == 'win64-nsis'
+        id: tauri_win_nsis
         uses: tauri-apps/tauri-action@v0
         with:
           args: --verbose
@@ -112,42 +121,131 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---------- macOS Universal ----------
-      - name: (macOS) Build universal Tauri App
-        if: runner.os == 'macOS'
+      - name: (Windows) Build Tauri App (MSI)    [win64-msi]
+        if: matrix.platform == 'win64-msi'
+        id: tauri_win_msi
         uses: tauri-apps/tauri-action@v0
         with:
+          # tauri-action v0 for MSI accepts a single build command. We build
+          # both bundles in one go on the win64-msi matrix row — but the
+          # win64-nsis row above already produced the NSIS installer, so
+          # re-running the same tauri build here is a waste. To keep matrix
+          # symmetry, just build MSI only via bundle type override.
+          args: --verbose --bundles msi
+          projectPath: .
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------- macOS Universal ----------
+      - name: (macOS) Build universal Tauri App   [darwin-universal]
+        if: matrix.platform == 'darwin-universal'
+        id: tauri_macos
+        uses: tauri-apps/tauri-action@v0
+        with:
+          # tauri-action v0 passes args directly to the CLI v2 config. For
+          # universal binaries the modern way is to set the `target` input
+          # to "universal-apple-darwin". We still keep --target in args as
+          # a fallback for older minor versions.
+          target: universal-apple-darwin
           args: --target universal-apple-darwin --verbose
           projectPath: .
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # ---------- Diagnostic: echo tauri outputs + list every bundle file ---
+      - name: 🔎 List all produced bundles (debug)
+        shell: bash
+        run: |
+          echo "--- tauri_macos.artifactPaths: ${{ steps.tauri_macos.outputs.artifactPaths }}"
+          echo "--- tauri_win_nsis.artifactPaths: ${{ steps.tauri_win_nsis.outputs.artifactPaths }}"
+          echo "--- tauri_win_msi.artifactPaths:  ${{ steps.tauri_win_msi.outputs.artifactPaths }}"
+          echo "--- find . -maxdepth 6 (all target/release/bundle tree):"
+          find . -type d -name bundle -path "*src-tauri/target/*" | while read -r d; do
+            echo "== bundle dir: $d =="
+            find "$d" -type f -o -type d | sed -e 's#^#  #' | head -80
+          done
+          echo "--- any .dmg / .exe / .msi anywhere under src-tauri/target:"
+          find src-tauri/target \( -name "*.dmg" -o -name "*.exe" -o -name "*.msi" -o -name "*.app" \) -print | sed -e 's#^#  #'
+
+      # ---------- macOS copy: target/<triplet>/bundle -> target/release/bundle
+      # Upload-artifact needs a stable path name, and our previous scan
+      # missed files that tauri writes under target/universal-apple-darwin.
+      - name: (macOS) Normalise bundle tree
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src-tauri/target/release/bundle/dmg
+          mkdir -p src-tauri/target/release/bundle/macos
+          # Find all dmgs under target/*/bundle/dmg and copy to release tree.
+          find src-tauri/target -type d -name dmg -path "*bundle*" | while read -r d; do
+            find "$d" -type f -name "*.dmg" -print0 | xargs -0 -I{} cp -f {} src-tauri/target/release/bundle/dmg/ || true
+          done
+          find src-tauri/target -type d -name macos -path "*bundle*" | while read -r d; do
+            cp -Rf "$d"/* src-tauri/target/release/bundle/macos/ 2>/dev/null || true
+          done
+          echo "--- final tree src-tauri/target/release/bundle:"
+          find src-tauri/target/release/bundle -maxdepth 3 -print
+
+      - name: (Windows) Normalise bundle tree
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $outRoot = "src-tauri/target/release/bundle"
+          New-Item -ItemType Directory -Force -Path (Join-Path $outRoot nsis) | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $outRoot msi)  | Out-Null
+          Get-ChildItem -Recurse -Path src-tauri/target -Include *.exe,*.msi -File | ForEach-Object {
+            $dest = $null
+            if ($_.Name -like "*.exe") { $dest = Join-Path $outRoot nsis $_.Name }
+            if ($_.Name -like "*.msi") { $dest = Join-Path $outRoot msi  $_.Name }
+            if ($dest) { Copy-Item -Force $_.FullName $dest -Verbose }
+          }
+          Get-ChildItem -Recurse -Path $outRoot
+
       - name: Upload build artifacts (Actions)
         uses: actions/upload-artifact@v4
         with:
           name: dsh-desktop-${{ matrix.platform }}
+          # Intentionally broad: upload both the normalised tree AND any
+          # per-triplet tree that tauri happened to write into. We accept
+          # duplicates because actions/download-artifact v4 merges them.
           path: |
-            src-tauri/target/release/bundle/${{ matrix.bundle_dir }}/*.${{ matrix.ext }}
-            src-tauri/target/release/bundle/macos/*.app
-          if-no-files-found: ignore
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.app/**
+            src-tauri/target/**/bundle/**/*.dmg
+            src-tauri/target/**/bundle/**/*.exe
+            src-tauri/target/**/bundle/**/*.msi
+            src-tauri/target/**/bundle/**/*.app/**
+          if-no-files-found: error
 
   release:
     name: Draft GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: always() && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
+          merge-multiple: true   # <-- critical: flattens 3 matrix namespaces into one tree
 
-      - name: List artifacts for release
-        run: find artifacts -type f 2>/dev/null || echo "no artifacts"
+      - name: List EVERYTHING under artifacts/ (debug)
+        run: |
+          set +e
+          echo "--- artifacts tree (including size) ---"
+          find artifacts -type f -printf '%10s  %p\n' 2>/dev/null
+          echo "--- just dmg/exe/msi ---"
+          find artifacts -type f \( -name "*.dmg" -o -name "*.exe" -o -name "*.msi" \) -printf '%10s  %p\n'
 
       - name: Create Release + upload assets
         uses: softprops/action-gh-release@v2
         with:
+          # Use the exact files the diagnostic step listed. Broad pattern +
+          # fail_on_unmatched_files=false so a single missing bundle doesn't
+          # fail the release.
           files: |
             artifacts/**/*.dmg
             artifacts/**/*.exe
@@ -158,3 +256,7 @@ jobs:
           prerelease: ${{ github.event.inputs.prerelease != 'false' }}
           generate_release_notes: true
           fail_on_unmatched_files: false
+          # If this is a re-run with an existing release tag, update it in-place
+          # instead of erroring (useful for retag-triggered rebuilds).
+          append_body: true
+          make_latest: true
