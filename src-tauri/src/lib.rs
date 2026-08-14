@@ -272,10 +272,34 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         }
     }
 
-    // Run 3-step verification against each candidate; return FIRST winner.
+    // Run verification against each candidate. For robustness:
+    //   1. `try_probe()` is the SOURCE OF TRUTH. It actually spawns the binary
+    //      with `-e 0` and checks exit 0 within 3s. This catches: broken
+    //      symlinks, wrong-arch binaries (even if metadata says it's a file +
+    //      +x), partial nvm installs, Rosetta crashes, missing runtime
+    //      libraries.
+    //   2. `is_file()` + `is_executable()` are ONLY used as a fast-path SKIP
+    //      for candidates that clearly don't exist (e.g. empty PATH entries),
+    //      to avoid 100s of spurious spawn calls.
     for c in candidates {
-        if c.is_file() && is_executable(&c) && try_probe(&c) {
-            return c.to_string_lossy().into_owned();
+        let c_str = c.to_string_lossy().into_owned();
+        let md = std::fs::metadata(&c).ok();
+        // Fast-skip candidates that do not exist at all (file not found).
+        // We MUST NOT skip on !is_file() alone — dangling symlinks (like a
+        // broken nvm install that left a `bin/node -> /nothing` symlink) have
+        // metadata() fail entirely, so they fall into `None` below, and we
+        // still skip cheaply. If metadata() succeeds but points to a broken
+        // symlink (unlikely) or wrong-arch binary, spawn will error promptly.
+        let skip_fast = match &md {
+            None => true,                    // No such file or broken symlink → skip
+            Some(m) if !m.is_file() => true, // Dir/socket/fifo → not a binary
+            Some(_) => false,                // Real regular file → run try_probe
+        };
+        if skip_fast {
+            continue;
+        }
+        if try_probe(&c) {
+            return c_str;
         }
     }
     if let Some(explicit) = explicit_user_candidate {
