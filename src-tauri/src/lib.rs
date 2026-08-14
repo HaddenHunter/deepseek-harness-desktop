@@ -329,12 +329,28 @@ fn resolve_runtime_binary(cmd: &str) -> String {
         }
         None => {
             eprintln!(
-                "[dsh-resolver] input={:?} -> NO candidate probed successfully (scanned {} candidates). Spawn will use the raw input and likely fail with os error.",
+                "[dsh-resolver] input={:?} -> NO candidate probed successfully (scanned {} candidates).",
                 cmd, candidates.len()
             );
-            // Final fallback: return the original string so spawn error names
-            // exactly what the user typed (not "node").
-            cmd.to_string()
+            // FINAL FALLBACK — but critically: NEVER return an
+            // absolute/qualified path that we have already proven will crash
+            // at spawn time (e.g. ghost nvm v26.7.0). This eliminates the
+            // infinite loop of
+            //   "user settings cache bad path → resolver returns it as
+            //    fallback → spawn os error 2 → same error forever".
+            //
+            // Instead, fall back to just the BASE NAME (e.g. "node" or
+            // "node.exe") so if the spawn still fails the error message
+            // tells the truth: "cannot find 'node' in PATH", not a fake
+            // ENOENT on a known-bad ghost path that nobody would
+            // intentionally choose today.
+            let fallback = if is_qualified { base.clone() } else { cmd.to_string() };
+            eprintln!(
+                "[dsh-resolver]  !  was asked for qualified path {:?} with 0 probe-hits; \
+                returning base name {:?} so error surface is honest.",
+                cmd, &fallback
+            );
+            fallback
         }
     }
 }

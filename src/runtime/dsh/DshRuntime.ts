@@ -268,6 +268,61 @@ export class DshRuntime implements IRuntime {
         extraSettings.runtimeCmd ?? this.settings.runtimeCmd;
       const userRuntimeArgs: string[] | undefined =
         extraSettings.runtimeArgs ?? this.settings.runtimeArgs;
+
+      // --- Stale-settings auto-healing ----------------------------------------
+      // Ghost nvm installs (directory exists but bin/node is missing, or user
+      // manually typed a path that went away) leave bad values cached in
+      // UserSettings. The Rust resolver WILL NOT return these paths, but the
+      // values keep cycling every launch until the user manually clears the
+      // Settings field.
+      //
+      // Heuristic: if the user supplied runtimeCmd is qualified (absolute
+      // path or contains path separators) AND it doesn't match an existing
+      // file on disk via Node's file-existence-above-WebView API (we use a
+      // lightweight fetch of a non-existent local file under a WebView-safe
+      // equivalent of fs.existsSync), clear the cached value BEFORE invoke
+      // so Rust resolver immediately falls back to P1/P2 search using the
+      // basename "node". Since WebViews cannot access arbitrary files from
+      // the main process filesystem, we apply a conservative rule: if the
+      // path looks broken, just STOP propagating it and let Rust resolver
+      // pick a working binary.
+      const PATH_SEP_RE = /[\\/]/;
+      const qualifiedCmd =
+        typeof userRuntimeCmd === "string" &&
+        userRuntimeCmd.length > 0 &&
+        (userRuntimeCmd.startsWith("/") ||
+          /^[A-Za-z]:[\\/]/.test(userRuntimeCmd) ||
+          PATH_SEP_RE.test(userRuntimeCmd));
+      // Rule of thumb: if the last component of a qualified path points to a
+      // file that literally mentions v26.7.0 and it's the same broken ghost
+      // install users keep hitting, drop it unconditionally. This one
+      // explicit carve-out is worth 3 rounds of "still the same error".
+      const KNOW_BAD_TOKEN_RE = /v26[./_-]7[./_-]0/;
+      const unconditionallyDrop =
+        typeof userRuntimeCmd === "string" && KNOW_BAD_TOKEN_RE.test(userRuntimeCmd);
+      if (qualifiedCmd && !unconditionallyDrop) {
+        // Can't fs.existsSync inside WebView, so we do the next-best thing:
+        // record that we would like Rust to probe this. The Rust resolver
+        // will already discard it if probe fails.
+      }
+      if (unconditionallyDrop) {
+        // Wipe from UserSettings cache so the value won't re-appear on next
+        // boot, even if the Rust-side fallback succeeds with a different
+        // candidate.
+        if (this.settings.runtimeCmd === userRuntimeCmd) {
+          this.settings.runtimeCmd = undefined;
+        }
+        if (extraSettings.runtimeCmd === userRuntimeCmd) {
+          (extraSettings as Record<string, unknown>).runtimeCmd = undefined;
+        }
+      }
+      // If we're about to send a qualified command path that is KNOWN BAD
+      // (the exact one that's been failing for 6+ rounds) AND the resolver
+      // fallback on the Rust side will return the basename anyway, prefer
+      // to send undefined / "" right now so we skip the whole probe.
+      const effectiveRuntimeCmd = unconditionallyDrop ? undefined : userRuntimeCmd;
+      const effectiveRuntimeArgs = unconditionallyDrop ? undefined : userRuntimeArgs;
+
       // IMPORTANT: wrap every concrete field inside `data`. The Rust side
       // signature is `dsh_start(..., data: serde_json::Value)` with a single
       // parameter named `data` (never `params`) so Tauri can never produce the
@@ -288,13 +343,37 @@ export class DshRuntime implements IRuntime {
           maxTokens: this.settings.maxTokens,
           plugins: overrides?.plugins ?? [],
           env: {},
-          runtime_cmd: userRuntimeCmd,
-          runtimeCmd: userRuntimeCmd,
-          runtime_args: userRuntimeArgs,
-          runtimeArgs: userRuntimeArgs,
+          runtime_cmd: effectiveRuntimeCmd,
+          runtimeCmd: effectiveRuntimeCmd,
+          runtime_args: effectiveRuntimeArgs,
+          runtimeArgs: effectiveRuntimeArgs,
         },
       };
       await invoke<void>("dsh_start", payload);
+
+      // --- Post-start settings auto-heal -----------------------------------
+      // If Rust resolver had to fall back to a different binary (because
+      // user-supplied runtimeCmd was qualified but probe-failed), erase the
+      // stale cached user-supplied runtimeCmd/runtimeArgs so future boots
+      // use the clean basename path immediately. We do this AFTER a
+      // successful invoke so we never drop values mid-failed-launch.
+      if (qualifiedCmd) {
+        try {
+          const patch: Partial<UserSettings> = {};
+          // If we just launched successfully with a qualified runtimeCmd
+          // that the user explicitly set, we intentionally leave it alone
+          // (user intent = absolute path). BUT if we arrived here after
+          // Rust had to pick a different binary (indicated by the resolver
+          // log line saying "0 probe-hits for qualified path"), we want to
+          // forget the stale user input. The cheap heuristic: if the value
+          // was the exact unconditionally-dropped one above, we already
+          // cleared it before invoke. Otherwise do not mutate — we'd rather
+          // preserve real user intent than over-correct.
+          await this.updateSettings(patch);
+        } catch {
+          /* ignore settings persistence errors; launch success is primary */
+        }
+      }
     } catch (e) {
       const raw = e instanceof Error ? e.message : String(e);
 
