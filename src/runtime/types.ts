@@ -122,7 +122,11 @@ export interface UserSettings {
   maxTokens: number;
   toolApprovalAutoAllow: string[];
   toolApprovalAutoDeny: string[];
-  telemetry: boolean;
+  telemetry: {
+    usage: boolean;
+    crash: boolean;
+    intervalSec: number;
+  };
   theme: "dark" | "light" | "system";
   runtimeCmd?: string;
   runtimeArgs?: string[];

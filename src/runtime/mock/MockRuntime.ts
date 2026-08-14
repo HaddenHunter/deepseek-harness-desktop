@@ -38,7 +38,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   maxTokens: 4096,
   toolApprovalAutoAllow: ["file_read", "search"],
   toolApprovalAutoDeny: ["shell:rm -rf"],
-  telemetry: false,
+  telemetry: { usage: false, crash: false, intervalSec: 900 },
   theme: "dark",
   appearance: {
     accentColor: "#6366f1",

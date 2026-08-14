@@ -224,7 +224,7 @@ export class DshRuntime implements IRuntime {
       maxTokens: 4096,
       toolApprovalAutoAllow: [],
       toolApprovalAutoDeny: [],
-      telemetry: false,
+      telemetry: { usage: false, crash: false, intervalSec: 900 },
       theme: "dark",
       appearance: {
         accentColor: "#6366f1",
